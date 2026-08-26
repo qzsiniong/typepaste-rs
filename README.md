@@ -119,15 +119,21 @@ flowchart TD
 ```mermaid
 flowchart TD
     Start([--part-size 指定]) --> Force[强制编码<br/>uid 无时间戳]
-    Force --> Split[按 part_size 切分<br/>每片算 md5]
-    Split --> Loop{遍历每片}
-    Loop -->|片 i| Heredoc[heredoc 写入<br/>base.pN]
-    Heredoc --> Verify[调用脚本校验该片 md5]
-    Verify -->|失败| MarkX[改名 .x<br/>--only-parts 重传]
-    Verify -->|成功| IsLast{i == total?}
-    IsLast -->|否| Loop
-    IsLast -->|是| Merge[cat p1..pN > base.suffix]
-    Merge --> Restore[走 decode→gunzip→unzip]
+    Force --> Split[按 part_size 切分编码串<br/>每片算 md5]
+    Split --> Select{--only-parts /<br/>--skip-parts?}
+    Select -->|指定| Filter[筛选待传分片]
+    Select -->|未指定| All[全部分片]
+    Filter --> Loop{遍历待传片 i}
+    All --> Loop
+    Loop -->|片 i| Heredoc[heredoc 写入 base.pN<br/>仅落盘不校验]
+    Heredoc --> More{还有片?}
+    More -->|是| Loop
+    More -->|否| Invoke[调用一次脚本:<br/>script uid_full local_md5 part_md5s]
+    Invoke --> Batch[批量校验所有分片 md5<br/>失败片改名 .x]
+    Batch --> Fail{全部通过?}
+    Fail -->|否| Stop([中止 exit 1<br/>--only-parts 重传])
+    Fail -->|是| Merge[cat p1..pN > base]
+    Merge --> Restore[decode → gunzip → md5 → unzip]
     Restore --> Done([还原完成])
 ```
 
