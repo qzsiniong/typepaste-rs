@@ -1,0 +1,19 @@
+[package]
+name = "typepaste-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+enigo = "0.3"
+md-5 = "0.10"
+base64 = "0.22"
+data-encoding = "2"
+hex = "0.4"
+flate2 = "1"
+zip = "2"
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ctrlc = "3"
+indicatif = "0.17"
+glob = "0.3.4"

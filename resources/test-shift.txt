@@ -1,0 +1,6 @@
+cat > out.txt << 'EOF'
+.>.>.>.<
+>test.dot.file<
+!@#$%^&*()
+Cat > File.b32
+EOF

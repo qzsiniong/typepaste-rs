@@ -1,0 +1,111 @@
+{
+	// 使用 IntelliSense 了解相关属性。 
+	// 悬停以查看现有属性的描述。
+	// 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug typepaste-rs",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=typepaste-rs",
+					"--package=typepaste-rs"
+				],
+				"filter": {
+					"name": "typepaste-rs",
+					"kind": "bin"
+				}
+			},
+			"args": [
+				// "./resources/test-shift.txt",
+				// "./resources/test.jpg",
+				// "./resources/test-ascii.txt",
+				// "./resources/",
+				"./README.md",
+			],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "deploy-script",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=typepaste-rs",
+					"--package=typepaste-rs"
+				],
+				"filter": {
+					"name": "typepaste-rs",
+					"kind": "bin"
+				}
+			},
+			"args": [
+				"--deploy-script",
+				"--target",
+				"gitbash",
+				// "--encode",
+				// "base16",
+				// "--dry-run",
+			],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "ignore",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=typepaste-rs",
+					"--package=typepaste-rs"
+				],
+				"filter": {
+					"name": "typepaste-rs",
+					"kind": "bin"
+				}
+			},
+			"args": [
+				"../typepaste-rs/",
+				"--exclude",
+				"target",
+				"--exclude",
+				"docs",
+				"--exclude",
+				"resources",
+				"--exclude",
+				".*",
+				// "--encode",
+				// "base16",
+				// "--dry-run",
+			],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "part",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=typepaste-rs",
+					"--package=typepaste-rs"
+				],
+				"filter": {
+					"name": "typepaste-rs",
+					"kind": "bin"
+				}
+			},
+			"args": [
+				"/tmp/typepaste_small.txt",
+				"--part-size",
+				"1k",
+				"--dry-run",
+			],
+			"cwd": "${workspaceFolder}"
+		},
+	]
+}
