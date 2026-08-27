@@ -34,6 +34,7 @@ use crate::utils::{
 #[derive(Parser, Debug)]
 #[command(
     name = "typepaste-rs",
+    version,
     about = "通过模拟键盘输入把文件/目录「粘贴」到目标机（如云桌面）"
 )]
 struct Args {

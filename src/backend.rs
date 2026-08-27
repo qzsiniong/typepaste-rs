@@ -15,6 +15,7 @@ use crate::keymap::{get_key_info, KeyAction};
 /// enigo 在 macOS 下 per-event 的 Shift 标志在 `kCGHIDEventTap` 不可靠，真正起作用的
 /// 是「硬件 Shift 状态」；Shift 事件发出后需等待其被系统处理，否则字符键早于 Shift
 /// 生效 → `>` 变 `.`。复刻原 Python quartz 后端 `time.sleep(0.005)` 经验值。
+#[allow(dead_code)]
 const SHIFT_SETTLE_MS: u64 = 5;
 
 #[cfg(target_os = "macos")]
@@ -52,6 +53,7 @@ impl Backend {
                 #[allow(unused_variables)]
                 base,
                 shift,
+                #[allow(unused_variables)]
                 mac_keycode,
             }) => {
                 if shift {
