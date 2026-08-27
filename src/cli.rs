@@ -587,7 +587,24 @@ fn run_chunked_transfer(
         let all_md5s = parts.part_md5s.join(",");
         let invoke =
             auto_invoke_command(args, &payload.uid_full, &payload.local_md5, Some(&all_md5s));
-        println!("  批量校验+合并调用：\n{invoke}");
+        let max_parts = 20;
+        if parts.total <= max_parts {
+            println!("  批量校验+合并调用：\n{invoke}");
+        } else {
+            let helper = match args.shell {
+                Shell::Bash => format!("{}__restore.sh", payload.uid_full),
+                Shell::Powershell => format!("{}__restore.ps1", payload.uid_full),
+            };
+            let helper_md5 = md5_of_bytes(format!("{invoke}\n").as_bytes());
+            let verify_cmd = auto_invoke_command(args, &helper, &helper_md5, None);
+            println!("  分片数 > {max_parts}，将还原命令写入 helper 文件 {helper} 并校验 md5：");
+            println!("    [heredoc 写入] {invoke}");
+            println!("    [md5 校验] {verify_cmd}");
+            match args.shell {
+                Shell::Bash => println!("    [手动执行] bash {helper}"),
+                Shell::Powershell => println!("    [手动执行] powershell -File {helper}"),
+            }
+        }
         return Ok(());
     }
 
@@ -637,18 +654,59 @@ fn run_chunked_transfer(
         std::thread::sleep(Duration::from_secs_f64(CMD_SLEEP));
     }
 
-    // 所有分片传完后，调用一次脚本：传入所有分片 md5，批量校验+合并+还原
-    let all_md5s = parts.part_md5s.join(",");
-    let invoke = auto_invoke_command(args, &payload.uid_full, &payload.local_md5, Some(&all_md5s));
-    type_command(&format!("{invoke}\n"), interval, &mut send_char, stop);
-
     println!(
         "\n✅ 已传输 {} 片（共 {} 片），uid 基础：{}",
         to_send.len(),
         parts.total,
         payload.uid_full
     );
-    println!("（已调用还原脚本批量校验所有分片并合并还原）");
+
+    // 所有分片传完后，调用一次脚本：传入所有分片 md5，批量校验+合并+还原
+    let all_md5s = parts.part_md5s.join(",");
+    let invoke = auto_invoke_command(args, &payload.uid_full, &payload.local_md5, Some(&all_md5s));
+    let max_parts = 20;
+    if parts.total <= max_parts {
+        type_command(&format!("{invoke}\n"), interval, &mut send_char, stop);
+        println!("（已调用还原脚本批量校验所有分片并合并还原）");
+    } else {
+        // 分片总数太大时，还原命令参数过长（超过目标终端单行限制），
+        // 先把完整还原命令写入 helper 脚本文件，校验无误后由用户手动执行。
+        println!("分片总数大于 {max_parts}，将还原命令写入 helper 文件并校验 md5");
+        let helper = match args.shell {
+            Shell::Bash => format!("{}__restore.sh", payload.uid_full),
+            Shell::Powershell => format!("{}__restore.ps1", payload.uid_full),
+        };
+        let hdr = heredoc_header(args.shell, &helper);
+        let ftr = heredoc_footer(args.shell, &helper);
+
+        // helper 文件内容 = 完整还原命令（含全部 md5 参数）+ 换行
+        let helper_content = format!("{invoke}\n");
+        let helper_md5 = md5_of_bytes(helper_content.as_bytes());
+
+        // 写入 helper 文件
+        type_text(
+            &format!("{hdr}{invoke}{ftr}"),
+            interval,
+            &mut send_char,
+            0,
+            stop,
+            false,
+        );
+        println!("已将还原命令写入 helper 文件：{helper}");
+
+        // 用还原脚本校验 helper 文件 md5（单文件模式：仅 md5 校验，不解码/解压）
+        let verify_cmd = auto_invoke_command(args, &helper, &helper_md5, None);
+        type_command(&format!("{verify_cmd}\n"), interval, &mut send_char, stop);
+        println!("（helper 文件 md5 校验中，目标端显示 [OK] md5 match 表示写入正确）");
+
+        // 不自动执行 helper 文件，提示用户手动执行
+        let run_hint = match args.shell {
+            Shell::Bash => format!("bash {helper}"),
+            Shell::Powershell => format!("powershell -File {helper}"),
+        };
+        println!("请手动执行还原命令：{run_hint}");
+    }
+
     std::mem::forget(backend); // 跳过 enigo Drop（其 Drop 中 thread::sleep 会累积阻塞）
     Ok(())
 }

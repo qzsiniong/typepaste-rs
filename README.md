@@ -129,8 +129,15 @@ flowchart TD
     Loop -->|片 i| Heredoc[heredoc 写入 base.pN<br/>仅落盘不校验]
     Heredoc --> More{还有片?}
     More -->|是| Loop
-    More -->|否| Invoke[调用一次脚本:<br/>script uid_full local_md5 part_md5s]
-    Invoke --> Batch[批量校验所有分片 md5<br/>失败片改名 .x]
+    More -->|否| Count{分片总数 ≤ 20?}
+    Count -->|是| Direct[直接调用脚本:<br/>script uid_full local_md5 part_md5s]
+    Count -->|否| WriteHelper[heredoc 写入 helper 文件<br/>内容即完整还原命令]
+    WriteHelper --> VerifyHelper[还原脚本校验 helper md5<br/>script helper helper_md5]
+    VerifyHelper --> HelperOk{md5 通过?}
+    HelperOk -->|否| HelperFail([写入错误<br/>重写 helper])
+    HelperOk -->|是| Manual[提示手动执行:<br/>bash helper.sh]
+    Direct --> Batch[批量校验所有分片 md5<br/>失败片改名 .x]
+    Manual -.手动执行.-> Batch
     Batch --> Fail{全部通过?}
     Fail -->|否| Stop([中止 exit 1<br/>--only-parts 重传])
     Fail -->|是| Merge[cat p1..pN > base]
@@ -186,7 +193,7 @@ typepaste-rs bigfile.bin --part-size 2m --only-parts 3 --delay 5
 typepaste-rs bigfile.bin --part-size 2m --skip-parts 1-2 --delay 5
 ```
 
-> 分片 uid 无时间戳（`typepaste_name.b32.p1`），便于多次运行定位同一文件；全部片传完后调用一次脚本，传入所有分片 md5（逗号分隔），目标端批量校验全部通过后 `cat p1..pN > base` 合并，并用原始数据整体 md5 校验最终还原结果。
+> 分片 uid 无时间戳（`typepaste_name.b32.p1`），便于多次运行定位同一文件；全部片传完后调用一次脚本，传入所有分片 md5（逗号分隔），目标端批量校验全部通过后 `cat p1..pN > base` 合并，并用原始数据整体 md5 校验最终还原结果。当分片总数大于 20 时，还原命令参数过长会超过目标终端单行限制，此时先将完整还原命令写入 helper 文件（`{uid}__restore.sh` / `.ps1`），再用还原脚本对 helper 文件做 md5 校验（单文件模式，仅校验不解码），确认写入无误后提示用户手动执行该 helper 文件。
 
 ### 数据管线判定
 

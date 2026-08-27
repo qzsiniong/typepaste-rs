@@ -12,6 +12,7 @@ function Get-Md5([string]$path) {
 }
 
 $cur = $File
+$ExpectedMd5 = $LocalMd5
 
 # 分片模式：$PartMd5s 非空时，批量校验所有分片后合并
 if ($PartMd5s) {
@@ -51,7 +52,6 @@ if ($PartMd5s) {
     $stream.Close()
     Write-Host "[OK] 已合并 $total 片 → $base"
     $cur = $base
-    $ExpectedMd5 = $LocalMd5
 }
 
 # decode
