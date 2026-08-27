@@ -1,10 +1,10 @@
 //! 工具：MD5、zip 归档、gzip 压缩、进度条、逐字符输入。
 
-use std::format;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime};
+use std::{eprintln, format};
 
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -96,7 +96,7 @@ pub fn zip_directory(
             if entry.file_type().is_dir() {
                 it.skip_current_dir();
             }
-            eprintln!("排除：{:?}", full);
+            eprintln!("排除：{full:?}");
             continue;
         }
 
@@ -131,7 +131,7 @@ pub fn zip_directory(
 }
 
 fn io_err(e: zip::result::ZipError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 /// gzip 压缩字节。
@@ -215,7 +215,7 @@ pub fn type_text<F: FnMut(char)>(
         for ch in chars.iter().copied().take(preview_count) {
             send_char(ch);
             i += 1;
-            if wrap_every > 0 && i % wrap_every == 0 && i < preview_count {
+            if wrap_every > 0 && i.is_multiple_of(wrap_every) && i < preview_count {
                 send_char('\n');
             }
         }
@@ -252,7 +252,7 @@ pub fn type_text<F: FnMut(char)>(
             std::thread::sleep(std::time::Duration::from_millis(interval));
         }
         pb.inc(1);
-        if wrap_every > 0 && i % wrap_every == 0 && i < total {
+        if wrap_every > 0 && i.is_multiple_of(wrap_every) && i < total {
             send_char('\n');
             if interval > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(interval));

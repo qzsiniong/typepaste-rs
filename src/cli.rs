@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{format, println};
+use std::{format, print, println};
 
 use clap::Parser;
 
@@ -388,7 +388,7 @@ fn run_transfer(file: &Path, args: &Args, stop: &Arc<AtomicBool>) -> Result<(), 
 
     // 打印管线决策。
     println!("━━━ typepaste-rs 数据管线 ━━━");
-    println!("  源      ：{:?}", file);
+    println!("  源      ：{file:?}");
     println!(
         "  归档    ：{}",
         if payload.is_dir { "是(zip)" } else { "否" }
@@ -450,9 +450,9 @@ fn run_raw_transfer(payload: &Payload, args: &Args, stop: &Arc<AtomicBool>) -> R
     let mut backend = prepare_input(stop)?;
     let mut send_char = |ch| {
         if args.dry_run {
-            print!("{}", ch)
+            print!("{ch}");
         } else {
-            backend.send_char(ch)
+            backend.send_char(ch);
         }
     };
 
@@ -489,9 +489,9 @@ fn run_auto_mode(payload: &Payload, args: &Args, stop: &Arc<AtomicBool>) -> Resu
     let mut backend = prepare_input(stop)?;
     let mut send_char = |ch| {
         if args.dry_run {
-            print!("{}", ch)
+            print!("{ch}");
         } else {
-            backend.send_char(ch)
+            backend.send_char(ch);
         }
     };
 
@@ -699,7 +699,7 @@ fn run_deploy(args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
     let mut backend = prepare_input(stop)?;
     let mut send_char = |ch| {
         if args.dry_run {
-            print!("{}", ch);
+            print!("{ch}");
         } else {
             backend.send_char(ch);
         }
@@ -774,7 +774,7 @@ fn count_down(seconds: u64, stop: &Arc<AtomicBool>) {
     if seconds == 0 {
         return;
     }
-    print!("{} 秒后开始输入", seconds);
+    print!("{seconds} 秒后开始输入");
     for n in (1..=seconds).rev() {
         print!("\r{n} 秒后开始输入...  ");
         use std::io::Write;
