@@ -45,9 +45,20 @@ jobs:
       - name: Install cross-compilation tools (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo dpkg --add-architecture arm64
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu libxdo-dev:arm64 libx11-dev:arm64 libxtst-dev:arm64 libxinerama-dev:arm64 libxrandr-dev:arm64 libxcb-keysyms1-dev:arm64 pkg-config
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          echo "LIBXDO_LIB_DIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "LIBXDO_INCLUDE_DIR=/usr/include" >> $GITHUB_ENV
+
+      - name: Install Linux system deps (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxdo-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
