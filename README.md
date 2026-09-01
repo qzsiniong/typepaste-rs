@@ -56,6 +56,7 @@ typepaste-rs [OPTIONS] [FILE]
 | `--output` | 远程文件名 | `--pull` 时的本地输出路径 |
 | `--pull-chunk-size` | `1024` | `--pull` 时每片原始字节数（base16 后为 2 倍字符数） |
 | `--pull-max-retry` | `5` | `--pull` 时单片 OCR 最大重试次数 |
+| `--pull-region` | 关 | `--pull` 时交互式框选截图区域（只截终端输出区，提升 OCR 准确率）；支持多显示器，每次运行都重新框选 |
 
 ### 流程图
 
@@ -243,6 +244,7 @@ flowchart TD
 **要点**
 - 选用 base16 而非 base32/base64：字符集仅 `0-9a-f`，OCR 歧义最小（仅 `8/b` 有风险，由 md5 兜底）。
 - 每片 ~1024 字节（2048 hex 字符 ≈ 26 终端行），可 `--pull-chunk-size` 调整。
+- **推荐加 `--pull-region`**：运行时弹出全屏半透明遮罩，拖拽框选终端的输出区域，后续截图只取该区域（去掉标题栏、滚动条、shell 提示符等噪声），OCR 准确率显著提升。支持多显示器（遮罩覆盖所有屏幕）；每次运行都重新框选。
 - macOS 下 OCR 用系统 Vision 框架（`screencapture` + Swift 调用 `VNRecognizeTextRequest`），无第三方依赖；非 macOS 暂不支持。
 - `--pull` 与正向 `file` 互斥；与 `--deploy-script` 互斥。
 - Plan B（QR 码序列）预留，暂未实现。

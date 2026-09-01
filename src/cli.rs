@@ -102,9 +102,13 @@ struct Args {
     #[arg(long, value_parser = parse_size, default_value_t = 1024)]
     pull_chunk_size: usize,
 
-    /// 反向传输单片最大重试次数（默认 5）。
-    #[arg(long, value_parser = non_neg_int, default_value_t = 5)]
+    /// 反向传输单片最大重试次数（默认 10）。
+    #[arg(long, value_parser = non_neg_int, default_value_t = 10)]
     pull_max_retry: u64,
+
+    /// 反向传输时交互式框选截图区域（提升 OCR 准确率）。
+    #[arg(long)]
+    pull_region: bool,
 }
 
 /// 分片模式产物。
@@ -189,7 +193,7 @@ pub fn main() {
 
 /// 反向传输动作：远程 → 本机。
 fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
-    let pull_args = PullArgs {
+    let mut pull_args = PullArgs {
         remote_path: remote_path.to_string(),
         local_out: args.output.clone(),
         shell: args.shell,
@@ -198,14 +202,16 @@ fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Resu
         interval: args.interval,
         delay: args.delay,
         dry_run: args.dry_run,
+        select_region: args.pull_region,
+        region: None,
     };
 
     if args.dry_run {
-        return run_pull(&pull_args, stop, |_, _, _| {});
+        return run_pull(&mut pull_args, stop, |_, _, _| {});
     }
 
     let mut backend = prepare_input(stop)?;
-    run_pull(&pull_args, stop, |cmd, interval, stop| {
+    run_pull(&mut pull_args, stop, |cmd, interval, stop| {
         type_command(cmd, interval, &mut |ch| backend.send_char(ch), stop);
     })
 }
@@ -939,6 +945,7 @@ mod tests {
             output: None,
             pull_chunk_size: 1024,
             pull_max_retry: 5,
+            pull_region: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "bash typepaste-restore.sh uid.b32 md5");
@@ -964,6 +971,7 @@ mod tests {
             output: None,
             pull_chunk_size: 1024,
             pull_max_retry: 5,
+            pull_region: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "myrestore.sh uid.b32 md5");
@@ -989,6 +997,7 @@ mod tests {
             output: None,
             pull_chunk_size: 1024,
             pull_max_retry: 5,
+            pull_region: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "powershell -File typepaste-restore.ps1 uid.b32 md5");
@@ -1086,6 +1095,7 @@ mod tests {
             output: None,
             pull_chunk_size: 1024,
             pull_max_retry: 5,
+            pull_region: false,
         };
         // 单次模式：不传 part_md5s
         let cmd = auto_invoke_command(&args, "uid.b32", "localmd5", None);

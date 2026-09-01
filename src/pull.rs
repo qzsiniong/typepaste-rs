@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::ocr::{parse_file_info, parse_hex_chunk, screenshot_ocr_lines};
+use crate::ocr::{parse_file_info, parse_hex_chunk, screenshot_ocr_lines, select_region, Region};
 use crate::restore_script::Shell;
-use crate::utils::md5_of_bytes;
+use crate::utils::{count_down, md5_of_bytes};
 
 /// 反向传输参数。
 pub struct PullArgs {
@@ -33,16 +33,28 @@ pub struct PullArgs {
     pub delay: u64,
     /// 预演模式。
     pub dry_run: bool,
+    /// 是否启用交互式框选截图区域。
+    pub select_region: bool,
+    /// 截图区域（左上原点 points），为 None 时用窗口/全屏。
+    pub region: Option<Region>,
 }
 
 /// 反向传输主入口。
 pub fn run_pull(
-    args: &PullArgs,
+    args: &mut PullArgs,
     stop: &Arc<AtomicBool>,
     mut type_command: impl FnMut(&str, u64, &AtomicBool),
 ) -> Result<(), String> {
     if args.dry_run {
         return dry_run_pull(args);
+    }
+
+    // 交互式框选截图区域
+    if args.select_region && args.region.is_none() {
+        println!("  请在屏幕上框选终端输出区域（Esc 取消）...");
+        let region = select_region()?;
+        args.region = Some(region);
+        println!("  截图区域：{region:?}");
     }
 
     println!("━━━ 反向传输（远程 → 本机）━━━");
@@ -133,7 +145,7 @@ fn probe_file_info(
         Shell::Bash => {
             let q = quote(path);
             format!(
-                "clear; stat -c%s {q}{path}{q} 2>/dev/null; md5sum {q}{path}{q} 2>/dev/null | cut -d' ' -f1\n"
+                "clear; stat -c%s {q}{path}{q} 2>/dev/null; stat -f%z {q}{path}{q} 2>/dev/null; md5sum {q}{path}{q} 2>/dev/null | cut -d' ' -f1\n"
             )
         }
         Shell::Powershell => {
@@ -147,11 +159,10 @@ fn probe_file_info(
     for attempt in 1..=args.max_retry {
         type_command(&cmd, args.interval, stop);
         std::thread::sleep(Duration::from_secs_f64(1.0));
-        let lines = screenshot_ocr_lines()?;
+        let lines = screenshot_ocr_lines(args.region)?;
         if let Some(info) = parse_file_info(&lines) {
             return Ok(info);
         }
-        // let shot = std::env::temp_dir().join(format!("tp_pull_{}.png", std::process::id()));
         eprintln!("  [探测] 第 {attempt} 次 OCR 未识别到文件信息，重试...");
         eprintln!(
             "    OCR 最后 6 行：{:?}",
@@ -173,7 +184,7 @@ fn prepare_remote_chunks(
     let cmd = match args.shell {
         Shell::Bash => {
             let q = quote(path);
-            let hex_width = chunk_bytes * 2;
+            let hex_width = chunk_bytes;
             format!(
                 "if command -v xxd >/dev/null 2>&1; then xxd -p -c {hex_width} {q}{path}{q} > /tmp/tp_pull.b16; else python3 -c \"import sys;d=open(sys.argv[1],'rb').read();[print(d[i:i+{chunk_bytes}].hex()) for i in range(0,len(d),{chunk_bytes})]\" {q}{path}{q} > /tmp/tp_pull.b16; fi\n"
             )
@@ -200,23 +211,24 @@ fn read_chunk_with_retry(
 ) -> Result<String, String> {
     let cmd = match args.shell {
         Shell::Bash => format!(
-            "clear; sleep .5; sed -n '{i}p' /tmp/tp_pull.b16; sed -n '{i}p' /tmp/tp_pull.b16 | tr -d '\\n' | md5sum | cut -d' ' -f1\n",
+            "clear; sleep .5; sed -n '{i}p' /tmp/tp_pull.b16 | sed -E 's/.{{50}}/&\\n/g'; sed -n '{i}p' /tmp/tp_pull.b16 | tr -d '\\n' | md5sum | cut -d' ' -f1\n",
         ),
         Shell::Powershell => {
             let idx = i - 1;
             format!(
-                "Clear-Host; $l=(Get-Content /tmp/tp_pull.b16)[{idx}]; $l; ($l -replace '\\r|\\n','') | ForEach-Object {{ (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($_))) -Algorithm MD5).Hash.ToLower() }}\n"
+                "Clear-Host; $l=(Get-Content /tmp/tp_pull.b16)[{idx}]; ($l -replace '(.{{50}})', ('$1' + \"`n\")); ($l -replace '\\r|\\n','') | ForEach-Object {{ (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($_))) -Algorithm MD5).Hash.ToLower() }}\n"
             )
         }
     };
 
+    type_command(&cmd, args.interval, stop);
+    std::thread::sleep(Duration::from_secs_f64(1.0));
     for attempt in 1..=args.max_retry {
         if stop.load(Ordering::Relaxed) {
             return Err("已停止".to_string());
         }
-        type_command(&cmd, args.interval, stop);
-        std::thread::sleep(Duration::from_secs_f64(2.0));
-        let lines = screenshot_ocr_lines()?;
+        std::thread::sleep(Duration::from_millis(500));
+        let lines = screenshot_ocr_lines(args.region)?;
         if let Some((hex, md5)) = parse_hex_chunk(&lines) {
             let actual = md5_of_bytes(hex.as_bytes());
             if actual == md5 {

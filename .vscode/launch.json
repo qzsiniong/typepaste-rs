@@ -107,5 +107,31 @@
 			],
 			"cwd": "${workspaceFolder}"
 		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "pull",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=typepaste-rs",
+					"--package=typepaste-rs"
+				],
+				"filter": {
+					"name": "typepaste-rs",
+					"kind": "bin"
+				}
+			},
+			"args": [
+				"--pull",
+				// "./Cargo.toml",
+				"./test.jpg",
+				// "./resources/test.jpg",
+				"--pull-region",
+				"--pull-chunk-size",
+				"100",
+			],
+			"cwd": "${workspaceFolder}"
+		},
 	]
 }
