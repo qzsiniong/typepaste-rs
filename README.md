@@ -52,6 +52,10 @@ typepaste-rs [OPTIONS] [FILE]
 | `--part-size` | - | 分片大小（`2m`/`500k`/字节数）。指定时启用分片传输；未指定且超过 5MB 报错。分片强制编码、uid 无时间戳 |
 | `--skip-parts` | - | 跳过指定分片（逗号+范围，1-based，如 `1,3-5`），仅分片模式 |
 | `--only-parts` | - | 只传指定分片（逗号+范围，1-based，如 `2,4`），仅分片模式 |
+| `--pull` | - | 反向传输：从远程桌面拉取文件到本机（远程文件路径）。指定后忽略 `file` |
+| `--output` | 远程文件名 | `--pull` 时的本地输出路径 |
+| `--pull-chunk-size` | `1024` | `--pull` 时每片原始字节数（base16 后为 2 倍字符数） |
+| `--pull-max-retry` | `5` | `--pull` 时单片 OCR 最大重试次数 |
 
 ### 流程图
 
@@ -205,6 +209,43 @@ typepaste-rs bigfile.bin --part-size 2m --skip-parts 1-2 --delay 5
 | 二进制文件（gzip 达阈值） | 否 | 是 | 强制 base32 | `name.gz.b32` |
 | 目录 | 是(zip) | 看阈值 | 强制 base32 | `name.zip[.gz].b32` |
 | 大文件（`--part-size`） | 看类型 | 看阈值 | 强制 base32 | `name[.zip][.gz].b32.p{n}`（无时间戳） |
+
+## 反向传输（远程 → 本机）
+
+```bash
+typepaste-rs --pull /remote/path/to/file [--output ./local_file]
+```
+
+通过 `--pull` 把远程桌面的文件拉回本机。原理：远程把文件编码为 **base16（hex）** 并按片输出到终端，本机**截图 + OCR** 逐片读取，每片校验 md5，失败自动重传该片，全部读取后拼接解码还原文件。
+
+**流程**
+
+```mermaid
+flowchart TD
+    Start([--pull 远程路径]) --> Probe[探测: stat + md5sum]
+    Probe --> Prep[远程: xxd/python3 转 base16<br/>按片切分到 /tmp/tp_pull.b16]
+    Prep --> Loop{逐片循环}
+    Loop --> Type[键入 clear + sed 输出<br/>内容行 + 该行 md5]
+    Type --> Shot[截图 + Vision OCR]
+    Shot --> Verify{本地 md5 匹配?}
+    Verify -->|否| Retry[重试该片（最多 --pull-max-retry）]
+    Retry --> Type
+    Verify -->|是| Collect[收集该 hex 片]
+    Collect --> More{还有片?}
+    More -->|是| Loop
+    More -->|否| Concat[拼接所有 hex]
+    Concat --> Decode[base16 解码 → 字节]
+    Decode --> Check{文件 md5<br/>匹配探测值?}
+    Check -->|是| Write[写本地文件]
+    Check -->|否| Fail([失败])
+```
+
+**要点**
+- 选用 base16 而非 base32/base64：字符集仅 `0-9a-f`，OCR 歧义最小（仅 `8/b` 有风险，由 md5 兜底）。
+- 每片 ~1024 字节（2048 hex 字符 ≈ 26 终端行），可 `--pull-chunk-size` 调整。
+- macOS 下 OCR 用系统 Vision 框架（`screencapture` + Swift 调用 `VNRecognizeTextRequest`），无第三方依赖；非 macOS 暂不支持。
+- `--pull` 与正向 `file` 互斥；与 `--deploy-script` 互斥。
+- Plan B（QR 码序列）预留，暂未实现。
 
 ## 还原脚本
 

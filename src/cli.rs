@@ -24,6 +24,7 @@ use crate::config::{
 use crate::encoder::Encoding;
 use crate::failsafe::start_failsafe_monitor;
 use crate::keymap::get_key_info;
+use crate::pull::{run_pull, PullArgs};
 use crate::restore_script::{
     decode_cmd, decode_cmd_for_shell, heredoc_footer, heredoc_header, parse_ops, Shell, Target,
 };
@@ -88,6 +89,22 @@ struct Args {
     /// 只传输指定分片（逗号分隔+范围，1-based，如 2,4）。仅分片模式生效。
     #[arg(long)]
     only_parts: Option<String>,
+
+    /// 反向传输：从远程桌面拉取文件到本机（远程文件路径）。
+    #[arg(long)]
+    pull: Option<String>,
+
+    /// 反向传输本地输出路径（默认取远程文件名）。
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// 反向传输每片原始字节数（默认 1024）。
+    #[arg(long, value_parser = parse_size, default_value_t = 1024)]
+    pull_chunk_size: usize,
+
+    /// 反向传输单片最大重试次数（默认 5）。
+    #[arg(long, value_parser = non_neg_int, default_value_t = 5)]
+    pull_max_retry: u64,
 }
 
 /// 分片模式产物。
@@ -149,11 +166,13 @@ pub fn main() {
 
     let result = if args.deploy_script {
         run_deploy(&args, &stop)
+    } else if let Some(remote) = &args.pull {
+        run_pull_mode(remote, &args, &stop)
     } else {
         match &args.file {
             Some(f) => run_transfer(f, &args, &stop),
             None => {
-                eprintln!("错误：缺少 <file>（或使用 --deploy-script 部署还原脚本）");
+                eprintln!("错误：缺少 <file>（或使用 --deploy-script / --pull）");
                 std::process::exit(2);
             }
         }
@@ -166,6 +185,29 @@ pub fn main() {
     if stop.load(Ordering::Relaxed) {
         std::process::exit(130);
     }
+}
+
+/// 反向传输动作：远程 → 本机。
+fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
+    let pull_args = PullArgs {
+        remote_path: remote_path.to_string(),
+        local_out: args.output.clone(),
+        shell: args.shell,
+        chunk_bytes: args.pull_chunk_size,
+        max_retry: args.pull_max_retry as usize,
+        interval: args.interval,
+        delay: args.delay,
+        dry_run: args.dry_run,
+    };
+
+    if args.dry_run {
+        return run_pull(&pull_args, stop, |_, _, _| {});
+    }
+
+    let mut backend = prepare_input(stop)?;
+    run_pull(&pull_args, stop, |cmd, interval, stop| {
+        type_command(cmd, interval, &mut |ch| backend.send_char(ch), stop);
+    })
 }
 
 /// 生成 uid 基础名：`typepaste_{ts}_{sanitized_name}`。
@@ -893,6 +935,10 @@ mod tests {
             part_size: None,
             skip_parts: None,
             only_parts: None,
+            pull: None,
+            output: None,
+            pull_chunk_size: 1024,
+            pull_max_retry: 5,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "bash typepaste-restore.sh uid.b32 md5");
@@ -914,6 +960,10 @@ mod tests {
             part_size: None,
             skip_parts: None,
             only_parts: None,
+            pull: None,
+            output: None,
+            pull_chunk_size: 1024,
+            pull_max_retry: 5,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "myrestore.sh uid.b32 md5");
@@ -935,6 +985,10 @@ mod tests {
             part_size: None,
             skip_parts: None,
             only_parts: None,
+            pull: None,
+            output: None,
+            pull_chunk_size: 1024,
+            pull_max_retry: 5,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "powershell -File typepaste-restore.ps1 uid.b32 md5");
@@ -1028,6 +1082,10 @@ mod tests {
             part_size: None,
             skip_parts: None,
             only_parts: None,
+            pull: None,
+            output: None,
+            pull_chunk_size: 1024,
+            pull_max_retry: 5,
         };
         // 单次模式：不传 part_md5s
         let cmd = auto_invoke_command(&args, "uid.b32", "localmd5", None);
