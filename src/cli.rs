@@ -477,7 +477,7 @@ fn run_auto_mode(payload: &Payload, args: &Args, stop: &Arc<AtomicBool>) -> Resu
 
     if args.dry_run {
         println!("[dry-run] auto 模式");
-        println!("  调用命令：{invoke}");
+        // println!("  调用命令：{invoke}");
     } else {
         count_down(args.delay, stop);
         if stop.load(Ordering::Relaxed) {
