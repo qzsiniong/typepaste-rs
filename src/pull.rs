@@ -126,7 +126,7 @@ pub fn run_pull(
             Path::new(&args.remote_path)
                 .file_name()
                 // tp_pulled_  + 年月日时分秒 + 远程文件名
-                .map(|n| format!("tp_pulled_{}_{}", ts, n.to_string_lossy().to_string(),))
+                .map(|n| format!("tp_pulled_{}_{}", ts, n.to_string_lossy()))
                 .unwrap_or_else(|| format!("tp_pulled_file_{}", ts)),
         ),
     };
