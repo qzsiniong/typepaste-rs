@@ -2,7 +2,8 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 use std::{eprintln, format};
 
@@ -11,6 +12,80 @@ use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use md5::{Digest, Md5};
 
 use crate::config::DRY_RUN_PREVIEW;
+
+// ── 日志系统 ──────────────────────────────────────────────────────────────
+
+/// 日志级别（数值越大越详细）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+}
+
+impl LogLevel {
+    fn prefix(self) -> &'static str {
+        match self {
+            LogLevel::Error => "  [错误] ",
+            LogLevel::Warn => "  [警告] ",
+            LogLevel::Info => "",
+            LogLevel::Debug => "  [调试] ",
+        }
+    }
+}
+
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
+
+/// 设置全局日志级别。
+pub fn set_log_level(level: LogLevel) {
+    LOG_LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+/// 全局进度条：Some 时日志走 `pb.println`（避免打断进度条），否则走 stderr。
+static GLOBAL_PB: OnceLock<Mutex<Option<ProgressBar>>> = OnceLock::new();
+
+pub fn global_pb() -> &'static Mutex<Option<ProgressBar>> {
+    GLOBAL_PB.get_or_init(|| Mutex::new(None))
+}
+
+/// 注册/注销全局进度条。进度条运行时调用 `set_global_pb(Some(pb.clone()))`，
+/// 结束时调用 `set_global_pb(None)`。
+pub fn set_global_pb(pb: Option<ProgressBar>) {
+    *global_pb().lock().unwrap() = pb;
+}
+
+/// 统一日志出口：按级别过滤，进度条运行时用 `pb.println`，否则 `eprintln!`。
+pub fn log(level: LogLevel, msg: &str) {
+    if (level as u8) > LOG_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
+    let line = format!("{}{}", level.prefix(), msg);
+    if let Some(pb) = global_pb().lock().unwrap().as_ref() {
+        pb.println(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => { $crate::utils::log($crate::utils::LogLevel::Info, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => { $crate::utils::log($crate::utils::LogLevel::Debug, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) => { $crate::utils::log($crate::utils::LogLevel::Warn, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => { $crate::utils::log($crate::utils::LogLevel::Error, &format!($($arg)*)) };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 
 /// 字节数组的 MD5（十六进制小写）。
 pub fn md5_of_bytes(data: &[u8]) -> String {
@@ -96,7 +171,7 @@ pub fn zip_directory(
             if entry.file_type().is_dir() {
                 it.skip_current_dir();
             }
-            eprintln!("排除：{full:?}");
+            info!("排除：{full:?}");
             continue;
         }
 
@@ -232,19 +307,15 @@ pub fn type_text<F: FnMut(char)>(
 
     let start = Instant::now();
     let pb = make_progress_bar(total as u64);
+    set_global_pb(Some(pb.clone()));
 
     let mut i = 0usize;
     for ch in text.chars() {
         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_char(ch))) {
             pb.abandon();
-            eprintln!(
-                "\n❌ 输入失败（第 {}/{} 字符 '{}'）：{:?}",
-                i + 1,
-                total,
-                ch,
-                e
-            );
-            eprintln!("   可能原因：辅助功能权限被撤销、目标窗口失焦、后端异常");
+            set_global_pb(None);
+            error!("\n输入失败（第 {}/{} 字符 '{}'）：{:?}", i + 1, total, ch, e);
+            error!("   可能原因：辅助功能权限被撤销、目标窗口失焦、后端异常");
             std::process::exit(1);
         }
         i += 1;
@@ -260,6 +331,7 @@ pub fn type_text<F: FnMut(char)>(
         }
     }
     pb.finish();
+    set_global_pb(None);
     start.elapsed().as_secs_f64()
 }
 

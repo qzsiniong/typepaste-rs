@@ -29,8 +29,10 @@ use crate::restore_script::{
     decode_cmd, decode_cmd_for_shell, heredoc_footer, heredoc_header, parse_ops, Shell, Target,
 };
 use crate::utils::{
-    gzip_compress, md5_of_bytes, sanitize_filename, type_command, type_text, zip_directory,
+    gzip_compress, md5_of_bytes, sanitize_filename, set_log_level, type_command, type_text,
+    zip_directory, LogLevel,
 };
+use crate::{error, warn};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,6 +79,10 @@ struct Args {
     /// 预演：仅打印决策/内容，不输入。
     #[arg(long)]
     dry_run: bool,
+
+    /// 详细日志：输出 OCR 耗时、截图路径等调试信息。
+    #[arg(short = 'v', long)]
+    verbose: bool,
 
     /// 分片大小（如 2m、500k、字节数）。指定时启用分片传输；未指定时超过 5MB 报错。
     #[arg(long, value_parser = parse_size)]
@@ -170,6 +176,12 @@ impl Payload {
 pub fn main() {
     let args = Args::parse();
 
+    set_log_level(if args.verbose {
+        LogLevel::Debug
+    } else {
+        LogLevel::Info
+    });
+
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl+C 紧急停止（与 fail-safe 鼠标监控共同置位）。
     let _ = ctrlc::set_handler({
@@ -185,14 +197,14 @@ pub fn main() {
         match &args.file {
             Some(f) => run_transfer(f, &args, &stop),
             None => {
-                eprintln!("错误：缺少 <file>（或使用 --deploy-script / --pull）");
+                error!("缺少 <file>（或使用 --deploy-script / --pull）");
                 std::process::exit(2);
             }
         }
     };
 
     if let Err(e) = result {
-        eprintln!("错误：{e}");
+        error!("{e}");
         std::process::exit(1);
     }
     if stop.load(Ordering::Relaxed) {
@@ -441,7 +453,7 @@ fn run_transfer(file: &Path, args: &Args, stop: &Arc<AtomicBool>) -> Result<(), 
         .iter()
         .filter_map(|s| {
             glob::Pattern::new(s)
-                .map_err(|e| eprintln!("--exclude 模式无效 {s:?}：{e}"))
+                .map_err(|e| warn!("--exclude 模式无效 {s:?}：{e}"))
                 .ok()
         })
         .collect();
@@ -993,6 +1005,7 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "bash typepaste-restore.sh uid.b32 md5");
@@ -1021,6 +1034,7 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "myrestore.sh uid.b32 md5");
@@ -1049,6 +1063,7 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "powershell -File typepaste-restore.ps1 uid.b32 md5");
@@ -1149,6 +1164,7 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            verbose: false,
         };
         // 单次模式：不传 part_md5s
         let cmd = auto_invoke_command(&args, "uid.b32", "localmd5", None);

@@ -3,6 +3,7 @@
 //! Ctrl+C 由 `ctrlc` handler 兜底（在 cli 中设置），与这里共同置位共享的 `stop`。
 //! 本模块启动 daemon 线程，独立创建 Enigo 读 `location()`，每 50ms 轮询一次。
 
+use crate::warn;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -31,7 +32,7 @@ fn monitor(stop: Arc<AtomicBool>) {
     let backend = match Backend::new(stop_never) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("⚠️  fail-safe 鼠标监控不可用（{e}），仅 Ctrl+C 可紧急停止");
+            warn!("fail-safe 鼠标监控不可用（{e}），仅 Ctrl+C 可紧急停止");
             return;
         }
     };
@@ -45,14 +46,14 @@ fn monitor(stop: Arc<AtomicBool>) {
             Some((x, y)) => {
                 if x <= CORNER_TOLERANCE && y <= CORNER_TOLERANCE {
                     stop.store(true, Ordering::Relaxed);
-                    eprintln!("\n🛑 紧急停止！鼠标移至左上角，已中止输入。");
+                    warn!("紧急停止！鼠标移至左上角，已中止输入。");
                     std::mem::forget(backend); // 跳过 enigo Drop
                     return;
                 }
             }
             None => {
                 if !warned {
-                    eprintln!("⚠️  无法读取鼠标位置，fail-safe 鼠标监控失效（Ctrl+C 仍可用）");
+                    warn!("无法读取鼠标位置，fail-safe 鼠标监控失效（Ctrl+C 仍可用）");
                     warned = true;
                 }
             }

@@ -15,6 +15,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::utils::md5_of_bytes;
+use crate::{debug, info, warn};
 
 /// 屏幕坐标区域（左上原点，points）。
 pub type Region = (i32, i32, i32, i32);
@@ -82,7 +83,7 @@ where
         let ts = chrono::Local::now().format("%Y%m%d%H%M%S%f").to_string();
         let tmp = std::env::temp_dir().join(format!("tp_pull_{ts}.png"));
         screenshot(&tmp, region)?;
-        eprintln!("    截图已保存: {}", tmp.display());
+        debug!("截图已保存: {}", tmp.display());
 
         let check = Arc::new(check);
         for &target_width in OCR_WIDTHS {
@@ -91,12 +92,12 @@ where
             let (proc_path, gray_img) = match preprocess_image(&tmp, target_width) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("    预处理失败（宽度 {target_width}px）：{e}，跳过");
+                    warn!("预处理失败（宽度 {target_width}px）：{e}，跳过");
                     continue;
                 }
             };
-            eprintln!(
-                "\n    目标宽度: {target_width}px（预处理 {:.0}ms）",
+            debug!(
+                "目标宽度: {target_width}px（预处理 {:.0}ms）",
                 proc_start.elapsed().as_secs_f64() * 1000.0
             );
             // 同一宽度下，各引擎并行识别；首个 check 通过的引擎立即通过 channel 返回，
@@ -121,16 +122,16 @@ where
                     let text = match ocr_with_engine(&proc_path, &gray_img, engine) {
                         Ok(t) => t,
                         Err(e) => {
-                            eprintln!(
-                                "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
+                            warn!(
+                                "引擎 {} 失败（{:.0}ms）：{e}，跳过",
                                 engine.name(),
                                 ocr_start.elapsed().as_secs_f64() * 1000.0
                             );
                             return;
                         }
                     };
-                    eprintln!(
-                        "    引擎 {} 完成（{:.0}ms）",
+                    debug!(
+                        "引擎 {} 完成（{:.0}ms）",
                         engine.name(),
                         ocr_start.elapsed().as_secs_f64() * 1000.0
                     );
@@ -140,7 +141,7 @@ where
                     }
                     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
                     if check(&lines) {
-                        eprintln!("    引擎 {} 通过 check", engine.name());
+                        info!("引擎 {} 通过 check", engine.name());
                         done.store(true, Ordering::Relaxed);
                         let _ = tx.send(lines);
                     }
@@ -375,7 +376,7 @@ fn preprocess_image(path: &Path, target_width: u32) -> Result<(PathBuf, image::G
     processed
         .save(&proc_path)
         .map_err(|e| format!("预处理图片保存失败：{e}"))?;
-    eprintln!("    预处理图片已保存: {}", proc_path.display());
+    debug!("预处理图片已保存: {}", proc_path.display());
     Ok((proc_path, gray))
 }
 
@@ -507,8 +508,8 @@ fn download_if_missing(path: &Path, url: &str) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
-    eprintln!(
-        "    下载 ocrs 模型：{}",
+    info!(
+        "下载 ocrs 模型：{}",
         path.file_name().unwrap_or_default().to_string_lossy()
     );
     let status = Command::new("curl")

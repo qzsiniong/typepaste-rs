@@ -16,7 +16,8 @@ use crate::ocr::{
     Region,
 };
 use crate::restore_script::Shell;
-use crate::utils::md5_of_bytes;
+use crate::utils::{md5_of_bytes, set_global_pb};
+use crate::{debug, info, warn};
 
 /// 反向传输参数。
 pub struct PullArgs {
@@ -91,10 +92,12 @@ pub fn run_pull(
     println!("共 {total_chunks} 片，开始逐片读取...");
 
     let pb = make_pull_progress(total_chunks as u64);
+    set_global_pb(Some(pb.clone()));
     let mut all_hex = String::with_capacity(file_size * 2);
 
     for i in 1..=total_chunks {
         if stop.load(Ordering::Relaxed) {
+            set_global_pb(None);
             pb.finish_and_clear();
             return Ok(());
         }
@@ -107,6 +110,7 @@ pub fn run_pull(
         all_hex.push_str(&chunk_hex);
         pb.inc(1);
     }
+    set_global_pb(None);
     pb.finish();
 
     // 步骤 3：解码 base16 → 字节，写本地文件，校验 md5
@@ -184,7 +188,7 @@ fn probe_file_info(
                 return Ok(info);
             }
         }
-        eprintln!("  [探测] 第 {round} 轮所有 OCR 组合均未识别到文件信息，重试...");
+        info!("[探测] 第 {round} 轮所有 OCR 组合均未识别到文件信息，重试...");
     }
     Err("探测文件信息失败（OCR 多次未识别）".to_string())
 }
@@ -234,18 +238,18 @@ fn debug_chunk_diff(i: usize, ocr_hex: Option<&str>) {
         None => return,
     };
 
-    eprintln!("  [调试] 片 {i} 期望内容（resources/tp_pull.txt 第 {i} 行）:");
-    eprintln!("    期望({:>4}): {}", expected.len(), expected);
+    debug!("片 {i} 期望内容（resources/tp_pull.txt 第 {i} 行）:");
+    debug!("  期望({:>4}): {}", expected.len(), expected);
 
     let actual = match ocr_hex {
         Some(h) => h,
         None => return,
     };
     if actual == expected {
-        eprintln!("    实际与期望一致");
+        debug!("  实际与期望一致");
         return;
     }
-    eprintln!("    实际({:>4}): {}", actual.len(), actual);
+    debug!("  实际({:>4}): {}", actual.len(), actual);
 
     // 逐字符差异标记：相同位置为空格，不同为 ^
     let max_len = expected.len().max(actual.len());
@@ -264,7 +268,7 @@ fn debug_chunk_diff(i: usize, ocr_hex: Option<&str>) {
             }
         }
     }
-    eprintln!("    差异({:>4}): {}", diff_count, diff);
+    debug!("  差异({:>4}): {}", diff_count, diff);
 }
 
 /// 读取第 i 片，带重试。
@@ -316,7 +320,7 @@ fn read_chunk_with_retry(
                 return Ok(hex);
             }
             None => {
-                eprintln!("  [片 {i}] 第 {round} 轮所有 OCR 组合均失败，重试...");
+                info!("[片 {i}] 第 {round} 轮所有 OCR 组合均失败，重试...");
                 debug_chunk_diff(i, None);
             }
         }
@@ -343,7 +347,7 @@ fn read_chunk_with_fallback(
     match read_chunk_with_retry(i, args, type_command, stop, None) {
         Ok(hex) => return Ok(hex),
         Err(e) => {
-            eprintln!("  [片 {i}] 常规读取失败：{e}，尝试切分为更小分片...");
+            info!("[片 {i}] 常规读取失败：{e}，尝试切分为更小分片...");
         }
     }
 
@@ -352,11 +356,11 @@ fn read_chunk_with_fallback(
     while sub_bytes >= MIN_SUB_CHUNK_BYTES && sub_bytes < chunk_i_bytes {
         match read_chunk_with_subsplit(i, chunk_i_bytes, sub_bytes, args, type_command, stop) {
             Ok(hex) => {
-                eprintln!("  [片 {i}] 子分片（{sub_bytes}B）读取成功");
+                info!("[片 {i}] 子分片（{sub_bytes}B）读取成功");
                 return Ok(hex);
             }
             Err(e) => {
-                eprintln!("  [片 {i}] 子分片（{sub_bytes}B）失败：{e}，尝试更小粒度...");
+                warn!("[片 {i}] 子分片（{sub_bytes}B）失败：{e}，尝试更小粒度...");
                 sub_bytes /= 2;
             }
         }
@@ -385,7 +389,7 @@ fn read_chunk_with_subsplit(
     std::thread::sleep(Duration::from_secs_f64(1.0));
 
     let sub_count = chunk_i_bytes.div_ceil(sub_bytes);
-    eprintln!("  [片 {i}] 切分为 {sub_count} 个子分片（每片 {sub_bytes}B）");
+    info!("[片 {i}] 切分为 {sub_count} 个子分片（每片 {sub_bytes}B）");
 
     let mut all_sub = String::with_capacity(chunk_i_bytes * 2);
     for j in 1..=sub_count {
