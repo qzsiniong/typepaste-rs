@@ -27,6 +27,14 @@ cargo build --release
 
 **macOS**：enigo 底层走 CGEvent，需在「系统设置 > 隐私与安全 > 辅助功能」中授权运行终端，否则按键无效。
 
+**macOS（使用 `--pull` 时）**：OCR 基于 Tesseract（leptess），需额外安装系统库：
+
+```bash
+brew install tesseract leptonica pkg-config
+```
+
+> 若为 Apple Silicon 且使用 Intel 版 brew（`/usr/local`），需编译为 x86_64 在 Rosetta 下运行（项目 `.cargo/config.toml` 已默认配置）。如需原生 arm64，请用 `/opt/homebrew` 安装上述库。
+
 **Linux**：enigo 默认走 X11（XWayland）；无图形环境会初始化失败并友好报错。
 
 ## 用法
@@ -227,7 +235,7 @@ flowchart TD
     Probe --> Prep[远程: xxd/python3 转 base16<br/>按片切分到 /tmp/tp_pull.b16]
     Prep --> Loop{逐片循环}
     Loop --> Type[键入 clear + sed 输出<br/>内容行 + 该行 md5]
-    Type --> Shot[截图 + Vision OCR]
+    Type --> Shot[截图 + Tesseract OCR]
     Shot --> Verify{本地 md5 匹配?}
     Verify -->|否| Retry[重试该片（最多 --pull-max-retry）]
     Retry --> Type
@@ -245,7 +253,7 @@ flowchart TD
 - 选用 base16 而非 base32/base64：字符集仅 `0-9a-f`，OCR 歧义最小（仅 `8/b` 有风险，由 md5 兜底）。
 - 每片 ~1024 字节（2048 hex 字符 ≈ 26 终端行），可 `--pull-chunk-size` 调整。
 - **推荐加 `--pull-region`**：运行时弹出全屏半透明遮罩，拖拽框选终端的输出区域，后续截图只取该区域（去掉标题栏、滚动条、shell 提示符等噪声），OCR 准确率显著提升。支持多显示器（遮罩覆盖所有屏幕）；每次运行都重新框选。
-- macOS 下 OCR 用系统 Vision 框架（`screencapture` + Swift 调用 `VNRecognizeTextRequest`），无第三方依赖；非 macOS 暂不支持。
+- OCR 使用 **Tesseract**（leptess 绑定）：通过 `tessedit_char_whitelist` 强制只输出 `0-9a-f`，从根本上消除 `ó→6`、`O→0`、`l→1` 等字符混淆；图像预处理（灰度 + 缩放到合适宽度）由 `image` crate 完成。Tesseract LSTM 对图像尺寸敏感，重试时自动切换缩放宽度（700–1600px）以提高识别率。识别后仍保留 `hex_confusion` 纠正作为安全网。需先 `brew install tesseract leptonica pkg-config`。
 - `--pull` 与正向 `file` 互斥；与 `--deploy-script` 互斥。
 - Plan B（QR 码序列）预留，暂未实现。
 

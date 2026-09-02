@@ -1,0 +1,10 @@
+# 本机为 Apple Silicon（arm64），但 brew 是 Intel 版（/usr/local），
+# 安装的 tesseract/leptonica 为 x86_64 架构，与 Rust 默认 arm64 目标不匹配。
+# 因此默认编译为 x86_64，在 Rosetta 2 下运行。
+# 如需原生 arm64，请用 /opt/homebrew 安装 tesseract leptonica 后删除本文件。
+[build]
+target = "x86_64-apple-darwin"
+
+# 允许 pkg-config 用于跨架构编译（host=arm64, target=x86_64）
+[env]
+PKG_CONFIG_ALLOW_CROSS = "1"

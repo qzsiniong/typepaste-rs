@@ -17,3 +17,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ctrlc = "3"
 indicatif = "0.17"
 glob = "0.3.4"
+leptess = "0.14"
+image = "0.25"
+ocrs = "0.9"
+rten = "0.13"
+
+# rten（ocrs 的 ONNX 推理引擎）在 debug 模式下极慢（单次识别可达分钟级），
+# 对依赖开启优化，主包保持 opt-level=0 便于调试。
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 3

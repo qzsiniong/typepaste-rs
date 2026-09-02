@@ -1,40 +1,137 @@
-//! 屏幕截图 + OCR（macOS Vision 框架）。
+//! 屏幕截图 + OCR（多引擎：Tesseract / ocrs / Tesseract CLI）。
 //!
 //! 反向传输（远程→本机）时，远程终端输出的文本需要通过截图+OCR 读取。
 //! 为提高识别率：
 //! 1. 优先截取前台窗口（而非全屏），避免菜单栏/Dock/其他窗口干扰；
-//! 2. Swift 侧做图像预处理：灰度化、对比度增强、2x 放大，文字更锐利；
-//! 3. Vision 请求关闭语言纠正、限定英文识别；
-//! 4. 识别后做字符混淆纠正（如 `ó`→`6`、`O`→`0`），再校验 md5。
+//! 2. 图像预处理：灰度化 + 缩放到合适宽度（Tesseract LSTM 对高分辨率敏感，过宽反而识别下降）；
+//! 3. 每轮截图后依次尝试所有（引擎×宽度）组合，直到 md5 校验通过；
+//! 4. 所有引擎字符白名单限定 `0-9a-f`，从根本上消除字符混淆；
+//! 5. 识别后做字符混淆纠正（兜底），再校验 md5。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+use crate::utils::md5_of_bytes;
 
 /// 屏幕坐标区域（左上原点，points）。
 pub type Region = (i32, i32, i32, i32);
 
-/// 截取屏幕并 OCR，返回识别的文本行列表（按从上到下顺序）。
+/// OCR 引擎。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OcrEngine {
+    /// leptess（Rust 绑定 Tesseract）。
+    Tesseract,
+    /// 纯 Rust ocrs（ONNX，自动下载模型）。
+    Ocrs,
+    /// 调用系统 `tesseract` 命令行。
+    TesseractCli,
+}
+
+impl OcrEngine {
+    fn name(&self) -> &'static str {
+        match self {
+            OcrEngine::Tesseract => "tesseract",
+            OcrEngine::Ocrs => "ocrs",
+            OcrEngine::TesseractCli => "tesseract-cli",
+        }
+    }
+}
+
+/// 每轮截图后依次尝试的引擎顺序。
+const OCR_ENGINES: &[OcrEngine] = &[
+    OcrEngine::Tesseract,
+    OcrEngine::Ocrs,
+    OcrEngine::TesseractCli,
+];
+
+/// 每轮截图后依次尝试的目标宽度（像素）。
+///
+/// 每个宽度只做一次图像缩放预处理，再依次用所有引擎识别，避免重复缩放。
+const OCR_WIDTHS: &[u32] = &[1000, 900, 1100, 1200, 1500];
+
+/// 每轮（所有组合失败后）的等待时间（毫秒），递减。
+///
+/// 重试的目的是等待远程终端渲染完成，首等待较长，后续递减。
+pub const OCR_RETRY_WAITS_MS: &[u64] = &[10, 500, 200, 100];
+
+/// 根据轮次（从1开始）返回该轮重试前的等待毫秒数。
+pub fn retry_wait_ms(round: usize) -> u64 {
+    OCR_RETRY_WAITS_MS[(round - 1).min(OCR_RETRY_WAITS_MS.len() - 1)]
+}
+
+/// 截图一次，依次用所有（引擎×宽度）组合做 OCR，返回首个使 `check` 通过的结果行。
 ///
 /// 仅 macOS 实现；非 macOS 返回错误。
 /// 若传入 `region`，只截该矩形区域；否则截前台窗口（回退全屏）。
-pub fn screenshot_ocr_lines(region: Option<Region>) -> Result<Vec<String>, String> {
+///
+/// 流程：截图 → 遍历 [`OCR_WIDTHS`]，每个宽度只缩放一次图片 → 再遍历 [`OCR_ENGINES`]
+/// 在同一张缩放图上识别 → 调 `check` → 成功则返回 `Ok(Some(lines))`；
+/// 所有组合均失败返回 `Ok(None)`，由调用方决定是否重新截图重试。
+pub fn screenshot_ocr_with_check<F>(
+    region: Option<Region>,
+    check: F,
+) -> Result<Option<Vec<String>>, String>
+where
+    F: Fn(&[String]) -> bool,
+{
     #[cfg(target_os = "macos")]
     {
-        // 年月日时分秒毫秒级时间戳，用于文件名避免冲突
         let ts = chrono::Local::now().format("%Y%m%d%H%M%S%f").to_string();
         let tmp = std::env::temp_dir().join(format!("tp_pull_{ts}.png"));
         screenshot(&tmp, region)?;
         eprintln!("    截图已保存: {}", tmp.display());
-        let text = ocr_image(&tmp)?;
-        // 将识别到的文本保存到文件，方便调试时查看
-        let ocr = std::env::temp_dir().join(format!("tp_pull_{ts}.ocr"));
-        std::fs::write(&ocr, &text).map_err(|e| format!("写入 OCR 文件失败：{e}"))?;
-        eprintln!("    OCR 识别已保存: {}", ocr.display());
-        Ok(text.lines().map(|l| l.to_string()).collect())
+
+        for &target_width in OCR_WIDTHS {
+            // 每个宽度只预处理（缩放）一次
+            let proc_start = Instant::now();
+            let (proc_path, gray_img) = match preprocess_image(&tmp, target_width) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("    预处理失败（宽度 {target_width}px）：{e}，跳过");
+                    continue;
+                }
+            };
+            eprintln!(
+                "\n    目标宽度: {target_width}px（预处理 {:.0}ms）",
+                proc_start.elapsed().as_secs_f64() * 1000.0
+            );
+            for &engine in OCR_ENGINES {
+                let ocr_start = Instant::now();
+                let text = match ocr_with_engine(&proc_path, &gray_img, engine) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(
+                            "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
+                            engine.name(),
+                            ocr_start.elapsed().as_secs_f64() * 1000.0
+                        );
+                        continue;
+                    }
+                };
+                eprintln!(
+                    "    引擎 {} 完成（{:.0}ms）",
+                    engine.name(),
+                    ocr_start.elapsed().as_secs_f64() * 1000.0
+                );
+
+                // 保存本次成功的 OCR 结果，方便调试
+                let ocr = std::env::temp_dir().join(format!("tp_pull_{ts}_{}.ocr", engine.name()));
+                let _ = std::fs::write(&ocr, &text);
+                eprintln!("    OCR 结果已保存: {}", ocr.display());
+
+                let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                if check(&lines) {
+                    return Ok(Some(lines));
+                }
+            }
+        }
+        Ok(None)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = region;
+        let _ = (region, check);
         Err("OCR 仅支持 macOS".to_string())
     }
 }
@@ -226,75 +323,180 @@ pub fn select_region() -> Result<Region, String> {
     Err("区域选择仅支持 macOS".to_string())
 }
 
-/// 用 macOS Vision 框架对图片做 OCR，返回全部文本。
+/// 图像预处理：灰度 + 缩放到 `target_width`（保持比例），保存到临时文件。
 ///
-/// 通过 Swift 脚本内联调用 VNRecognizeTextRequest，并做灰度+对比度+放大预处理。
-#[cfg(target_os = "macos")]
-fn ocr_image(path: &Path) -> Result<String, String> {
-    let path_str = path.to_string_lossy().to_string();
-    let swift_code = format!(
-        r#"
-import Foundation
-import Vision
-import AppKit
-import CoreImage
+/// 返回（预处理图片路径，灰度图内存对象），供不同引擎复用，避免每个引擎重复缩放。
+///
+/// `target_width` 影响识别率：过高分辨率（如 2000+px）反而导致
+/// 细字符（`1`）被吞没；不同尺寸识别结果不同，重试时切换尺寸可提高成功率。
+fn preprocess_image(path: &Path, target_width: u32) -> Result<(PathBuf, image::GrayImage), String> {
+    let img = image::open(path).map_err(|e| format!("图片加载失败：{e}"))?;
+    let (w, h) = (img.width(), img.height());
+    let new_w = target_width.max(100);
+    let new_h = ((h as u64) * (new_w as u64) / (w as u64).max(1)) as u32;
+    let processed =
+        img.grayscale()
+            .resize_exact(new_w, new_h.max(1), image::imageops::FilterType::Triangle);
+    let gray = processed.to_luma8();
 
-let path = "{path}"
-guard let img = NSImage(contentsOfFile: path),
-      let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {{
-    fputs("ERR:load\n", stderr)
-    exit(1)
-}}
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S%f").to_string();
+    let proc_path = std::env::temp_dir().join(format!("tp_ocr_proc_{ts}.png"));
+    processed
+        .save(&proc_path)
+        .map_err(|e| format!("预处理图片保存失败：{e}"))?;
+    eprintln!("    预处理图片已保存: {}", proc_path.display());
+    Ok((proc_path, gray))
+}
 
-// 图像预处理：灰度 + 高对比度 + 放大，让文字更锐利
-let ci = CIImage(cgImage: cg)
-let filter = CIFilter(name: "CIColorControls")
-filter?.setValue(ci, forKey: kCIInputImageKey)
-filter?.setValue(0.0, forKey: kCIInputSaturationKey)   // 灰度
-filter?.setValue(2.5, forKey: kCIInputContrastKey)      // 高对比度
-let filtered = filter?.outputImage ?? ci
+/// 按引擎分派到不同后端（Tesseract / ocrs / Tesseract CLI），各后端均限定
+/// 字符白名单 `0123456789abcdef`。`proc_path` 为已缩放的灰度图文件，
+/// `gray_img` 为同一张图的内存对象（ocrs 直接使用，避免重复读取文件）。
+fn ocr_with_engine(
+    proc_path: &Path,
+    gray_img: &image::GrayImage,
+    engine: OcrEngine,
+) -> Result<String, String> {
+    match engine {
+        OcrEngine::Tesseract => ocr_with_leptess(proc_path),
+        OcrEngine::Ocrs => ocr_with_ocrs(gray_img),
+        OcrEngine::TesseractCli => ocr_with_tesseract_cli(proc_path),
+    }
+}
 
-// 2x 放大（小字体 OCR 更准）
-let scaled = filtered.transformed(by: CGAffineTransform(scaleX: 2.0, y: 2.0))
+/// 用 leptess（Rust 绑定 Tesseract）做 OCR。
+fn ocr_with_leptess(proc_path: &Path) -> Result<String, String> {
+    let tess = tesseract_instance()?;
+    let mut tess = tess
+        .lock()
+        .map_err(|_| "Tesseract 实例锁失败".to_string())?;
+    tess.set_image(proc_path)
+        .map_err(|e| format!("设置图片失败：{e}"))?;
+    tess.set_source_resolution(300);
+    tess.get_utf8_text()
+        .map_err(|e| format!("OCR 识别失败：{e}"))
+}
 
-let context = CIContext()
-guard let outCg = context.createCGImage(scaled, from: scaled.extent) else {{
-    fputs("ERR:proc\n", stderr)
-    exit(1)
-}}
+/// 用 ocrs（纯 Rust）做 OCR，字符限定为 hex。
+fn ocr_with_ocrs(img: &image::GrayImage) -> Result<String, String> {
+    let engine = ocrs_instance()?;
+    let src = ocrs::ImageSource::from_bytes(img.as_raw(), img.dimensions())
+        .map_err(|e| format!("ocrs ImageSource 失败：{e}"))?;
+    let input = engine
+        .prepare_input(src)
+        .map_err(|e| format!("ocrs prepare_input 失败：{e}"))?;
+    engine
+        .get_text(&input)
+        .map_err(|e| format!("ocrs 识别失败：{e}"))
+}
 
-let req = VNRecognizeTextRequest()
-req.recognitionLevel = .accurate
-req.usesLanguageCorrection = false
-req.recognitionLanguages = ["en-US"]
-if #available(macOS 11.0, *) {{
-    req.minimumTextHeight = 0.01
-}}
-let handler = VNImageRequestHandler(cgImage: outCg, options: [:])
-do {{
-    try handler.perform([req])
-}} catch {{
-    fputs("ERR:vision\n", stderr)
-    exit(1)
-}}
-let obs = req.results ?? []
-let lines = obs.compactMap {{ $0.topCandidates(1).first?.string }}
-print(lines.joined(separator: "\n"))
-"#,
-        path = path_str.replace('\\', "\\\\").replace('"', "\\\"")
-    );
-
-    let output = Command::new("swift")
-        .args(["-e", &swift_code])
+/// 调用系统 `tesseract` 命令行做 OCR。
+fn ocr_with_tesseract_cli(proc_path: &Path) -> Result<String, String> {
+    let output = Command::new("tesseract")
+        .args([
+            proc_path.to_str().unwrap_or(""),
+            "stdout",
+            "--psm",
+            "4",
+            "-c",
+            "tessedit_char_whitelist=0123456789abcdef",
+        ])
         .output()
-        .map_err(|e| format!("swift 执行失败：{e}"))?;
-
+        .map_err(|e| format!("tesseract 命令执行失败（请确认已安装 tesseract）：{e}"))?;
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("OCR 失败：{err}"));
+        return Err(format!(
+            "tesseract 退出码：{:?}，stderr：{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 全局 Tesseract(leptess) 实例，懒加载并复用。
+fn tesseract_instance() -> Result<&'static Mutex<leptess::LepTess>, String> {
+    static INSTANCE: OnceLock<Mutex<leptess::LepTess>> = OnceLock::new();
+    if let Some(lock) = INSTANCE.get() {
+        return Ok(lock);
+    }
+    let mut lt = leptess::LepTess::new(None, "eng")
+        .map_err(|e| format!("Tesseract 初始化失败（请确认已安装 tesseract + eng 语言包）：{e}"))?;
+    lt.set_variable(leptess::Variable::TesseditCharWhitelist, "0123456789abcdef")
+        .map_err(|e| format!("设置字符白名单失败：{e}"))?;
+    lt.set_variable(leptess::Variable::TesseditPagesegMode, "4")
+        .map_err(|e| format!("设置页面分割模式失败：{e}"))?;
+    lt.set_variable(leptess::Variable::TextordNoiseRejwords, "0")
+        .map_err(|e| format!("设置噪声过滤失败：{e}"))?;
+    lt.set_variable(leptess::Variable::TextordNoiseRejrows, "0")
+        .map_err(|e| format!("设置行噪声过滤失败：{e}"))?;
+    Ok(INSTANCE.get_or_init(|| Mutex::new(lt)))
+}
+
+/// 全局 ocrs 引擎实例，懒加载并复用。
+///
+/// 首次调用会自动下载检测/识别模型（.rten）到 `~/.cache/ocrs`，需网络。
+fn ocrs_instance() -> Result<&'static ocrs::OcrEngine, String> {
+    static INSTANCE: OnceLock<ocrs::OcrEngine> = OnceLock::new();
+    if let Some(engine) = INSTANCE.get() {
+        return Ok(engine);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    // 模型缓存目录：~/.cache/ocrs
+    let cache_dir = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(".cache")
+        .join("ocrs");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("创建 ocrs 模型缓存目录失败：{e}"))?;
+
+    let det_path = cache_dir.join("text-detection.rten");
+    let rec_path = cache_dir.join("text-recognition.rten");
+    const DET_URL: &str = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten";
+    const REC_URL: &str = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten";
+
+    download_if_missing(&det_path, DET_URL)?;
+    download_if_missing(&rec_path, REC_URL)?;
+
+    let detection_model =
+        rten::Model::load_file(&det_path).map_err(|e| format!("加载 ocrs 检测模型失败：{e}"))?;
+    let recognition_model =
+        rten::Model::load_file(&rec_path).map_err(|e| format!("加载 ocrs 识别模型失败：{e}"))?;
+
+    let params = ocrs::OcrEngineParams {
+        detection_model: Some(detection_model),
+        recognition_model: Some(recognition_model),
+        allowed_chars: Some("0123456789abcdef".to_string()),
+        ..Default::default()
+    };
+    let engine = ocrs::OcrEngine::new(params).map_err(|e| format!("ocrs 引擎初始化失败：{e}"))?;
+    Ok(INSTANCE.get_or_init(|| engine))
+}
+
+/// 若文件不存在，用 curl 从 `url` 下载到 `path`。
+fn download_if_missing(path: &Path, url: &str) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    eprintln!(
+        "    下载 ocrs 模型：{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let status = Command::new("curl")
+        .args(["-sL", "-o"])
+        .arg(path)
+        .arg(url)
+        .status()
+        .map_err(|e| {
+            format!(
+                "curl 执行失败（请确认已安装 curl 或手动下载模型到 {}）：{e}",
+                path.display()
+            )
+        })?;
+    if !status.success() {
+        // 下载失败时清理可能的空文件
+        let _ = std::fs::remove_file(path);
+        return Err(format!("模型下载失败（退出码：{status:?}），URL：{url}"));
+    }
+    Ok(())
 }
 
 /// 字符混淆纠正表：把 OCR 常见误识别字符映射回 hex 字符集（0-9a-f）。
@@ -375,11 +577,13 @@ pub fn parse_hex_chunk(lines: &[String]) -> Option<(String, String)> {
 
     // 从底部向上找第一个 32 位 hex 行（md5）
     for i in (1..non_empty.len()).rev() {
+        // println!("{} ==> {}", i, non_empty[i]);
         let md5 = normalize_hex(non_empty[i]);
         if md5.len() == 32 {
             // 向上收集所有连续的内容行（终端自动换行可能把内容拆成多行）
             let mut content = String::new();
             for j in (0..i).rev() {
+                // println!("{} ==> {}", j, non_empty[j]);
                 if !is_hex_content_line(non_empty[j]) {
                     break; // 遇到命令回显、提示符等非内容行停止
                 }
@@ -395,8 +599,9 @@ pub fn parse_hex_chunk(lines: &[String]) -> Option<(String, String)> {
 
 /// 从 OCR 文本行中尝试解析文件大小和 md5（探测阶段）。
 ///
-/// 远程输出：文件大小（数字）+ 文件 md5（32 位 hex）。
-/// 从底部向上扫描找 md5 行，其上一行纠正数字后为大小。
+/// 远程输出三行：文件大小（数字）、文件 md5（32 位 hex）、校验和 md5(size+md5)（32 位 hex）。
+/// 从底部向上扫描：找底部 32-hex 行为 checksum，其上一行同为 32-hex 为 file_md5，再上一行为 size；
+/// 校验 md5(size + file_md5) == checksum 通过才返回，否则返回 None 触发重试。
 pub fn parse_file_info(lines: &[String]) -> Option<(usize, String)> {
     let non_empty: Vec<&str> = lines
         .iter()
@@ -404,11 +609,19 @@ pub fn parse_file_info(lines: &[String]) -> Option<(usize, String)> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    for i in (1..non_empty.len()).rev() {
-        let md5 = normalize_hex(non_empty[i]);
-        if md5.len() == 32 {
-            let size: usize = normalize_digits(non_empty[i - 1]).parse().ok()?;
-            return Some((size, md5));
+    for i in (2..non_empty.len()).rev() {
+        let checksum = normalize_hex(non_empty[i]);
+        if checksum.len() != 32 {
+            continue;
+        }
+        let file_md5 = normalize_hex(non_empty[i - 1]);
+        if file_md5.len() != 32 {
+            continue;
+        }
+        let size: usize = normalize_digits(non_empty[i - 2]).parse().ok()?;
+        let expected = md5_of_bytes(format!("{size}{file_md5}").as_bytes());
+        if expected == checksum {
+            return Some((size, file_md5));
         }
     }
     None
@@ -513,10 +726,11 @@ mod tests {
         let lines = vec![
             "1024".to_string(),
             "abcdef0123456789abcdef0123456789".to_string(),
+            "17e00497124c8f0ae9a581cbfab00312".to_string(), // md5("1024" + file_md5)
         ];
         let (size, md5) = parse_file_info(&lines).unwrap();
         assert_eq!(size, 1024);
-        assert_eq!(md5.len(), 32);
+        assert_eq!(md5, "abcdef0123456789abcdef0123456789");
     }
 
     #[test]
@@ -525,6 +739,7 @@ mod tests {
             "stat -c%s /tmp/test.txt".to_string(),
             "1024".to_string(),
             "abcdef0123456789abcdef0123456789".to_string(),
+            "17e00497124c8f0ae9a581cbfab00312".to_string(), // md5("1024" + file_md5)
             "$".to_string(),
         ];
         let (size, md5) = parse_file_info(&lines).unwrap();
@@ -538,8 +753,31 @@ mod tests {
         let lines = vec![
             "ló2O".to_string(), // 应为 1620
             "abcdef0123456789abcdef0123456789".to_string(),
+            "d69bf443a2c38a48b7cf76bf512f91cf".to_string(), // md5("1620" + file_md5)
         ];
-        let (size, _) = parse_file_info(&lines).unwrap();
+        let (size, md5) = parse_file_info(&lines).unwrap();
         assert_eq!(size, 1620);
+        assert_eq!(md5, "abcdef0123456789abcdef0123456789");
+    }
+
+    #[test]
+    fn parse_file_info_checksum_mismatch() {
+        // checksum 错误时应返回 None
+        let lines = vec![
+            "1024".to_string(),
+            "abcdef0123456789abcdef0123456789".to_string(),
+            "00000000000000000000000000000000".to_string(), // 错误的 checksum
+        ];
+        assert!(parse_file_info(&lines).is_none());
+    }
+
+    #[test]
+    fn parse_file_info_missing_checksum() {
+        // 仅两行（旧格式）应返回 None
+        let lines = vec![
+            "1024".to_string(),
+            "abcdef0123456789abcdef0123456789".to_string(),
+        ];
+        assert!(parse_file_info(&lines).is_none());
     }
 }

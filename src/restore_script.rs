@@ -56,6 +56,24 @@ impl Target {
         }
     }
 
+    /// 内嵌 pull 脚本内容。
+    pub fn pull_script(self) -> &'static str {
+        match self {
+            Target::Linux => include_str!("../scripts/pull_linux.sh"),
+            Target::Mac => include_str!("../scripts/pull_mac.sh"),
+            Target::Gitbash => include_str!("../scripts/pull_gitbash.sh"),
+            Target::Powershell => include_str!("../scripts/pull_powershell.ps1"),
+        }
+    }
+
+    /// pull 脚本落地文件名。
+    pub fn pull_landing_name(self) -> &'static str {
+        match self {
+            Target::Powershell => "typepaste-pull.ps1",
+            _ => "typepaste-pull.sh",
+        }
+    }
+
     pub fn all() -> [Target; 4] {
         [
             Target::Linux,
@@ -286,6 +304,8 @@ mod tests {
         for t in Target::all() {
             assert!(!t.script().is_empty());
             assert!(t.landing_name().starts_with("typepaste-restore."));
+            assert!(!t.pull_script().is_empty());
+            assert!(t.pull_landing_name().starts_with("typepaste-pull."));
         }
     }
 

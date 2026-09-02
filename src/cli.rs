@@ -109,6 +109,15 @@ struct Args {
     /// 反向传输时交互式框选截图区域（提升 OCR 准确率）。
     #[arg(long)]
     pull_region: bool,
+
+    /// 反向传输时在每个字符前加空格（提升 OCR 分割准确率，默认关闭）。
+    /// 可用 `--pull-char-space` 开启。
+    #[arg(long)]
+    pull_char_space: bool,
+
+    /// 反向传输时分片显示每行字符数（默认 50）。
+    #[arg(long, value_parser = non_neg_int, default_value_t = 50)]
+    pull_line_width: u64,
 }
 
 /// 分片模式产物。
@@ -204,6 +213,8 @@ fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Resu
         dry_run: args.dry_run,
         select_region: args.pull_region,
         region: None,
+        char_space: args.pull_char_space,
+        line_width: args.pull_line_width as usize,
     };
 
     if args.dry_run {
@@ -213,7 +224,9 @@ fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Resu
     let mut backend = prepare_input(stop)?;
     run_pull(&mut pull_args, stop, |cmd, interval, stop| {
         type_command(cmd, interval, &mut |ch| backend.send_char(ch), stop);
-    })
+    })?;
+    std::mem::forget(backend); // 跳过 enigo Drop（其 Drop 中 thread::sleep 会累积阻塞）
+    Ok(())
 }
 
 /// 生成 uid 基础名：`typepaste_{ts}_{sanitized_name}`。
@@ -759,15 +772,67 @@ fn run_chunked_transfer(
     Ok(())
 }
 
-/// 部署还原脚本动作。
+/// 部署单个脚本到目标机（heredoc + 编码 + 解码）。
+fn deploy_one_script(
+    script: &str,
+    landing: &str,
+    args: &Args,
+    stop: &Arc<AtomicBool>,
+    send_char: &mut impl FnMut(char),
+) -> Result<(), String> {
+    let enc = args.encode.unwrap_or(DEFAULT_ENCODING);
+    let interval = if args.dry_run { 0u64 } else { args.interval };
+    let suffix = enc.encoder().suffix();
+    let encoded_file = format!("{landing}.{suffix}");
+    let cat_script = enc.encoder().encode(script.as_bytes());
+    let cmd = decode_cmd_for_shell(args.shell, enc, &encoded_file, landing);
+
+    // 输入 heredoc 头。
+    type_command(
+        &heredoc_header(args.shell, &encoded_file),
+        interval,
+        send_char,
+        stop,
+    );
+
+    // 输入编码后的脚本。
+    type_text(
+        &cat_script,
+        interval,
+        send_char,
+        WRAP_EVERY,
+        stop,
+        args.dry_run,
+    );
+
+    // 输入 heredoc 尾
+    type_command(
+        &format!("{}\n", heredoc_footer(args.shell, &encoded_file)),
+        interval,
+        send_char,
+        stop,
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    // 输入执行解码命令。
+    type_command(&format!("{cmd}\n"), interval, send_char, stop);
+    std::thread::sleep(Duration::from_secs(2));
+
+    Ok(())
+}
+
+/// 部署脚本动作（还原脚本 + 拉取脚本）。
 fn run_deploy(args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
     // 无 --target：预览所有平台变体。
     let target = match args.target {
         Some(t) => t,
         None => {
             for t in Target::all() {
-                println!("=== {} ===", t.label());
+                println!("=== {} (restore) ===", t.label());
                 println!("{}", t.script());
+                println!("=== {} (pull) ===", t.label());
+                println!("{}", t.pull_script());
                 println!();
             }
             println!("提示：使用 --target <variant> 部署到目标机。");
@@ -775,15 +840,12 @@ fn run_deploy(args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
         }
     };
 
-    // 编码判定：--encode 未给→默认
     let enc = args.encode.unwrap_or(DEFAULT_ENCODING);
 
-    let script = target.script();
-    let landing = target.landing_name();
-
-    println!("━━━ 部署还原脚本 ━━━");
+    println!("━━━ 部署脚本 ━━━");
     println!("  目标平台：{}", target.label());
-    println!("  落地文件：{landing}");
+    println!("  还原脚本：{}", target.landing_name());
+    println!("  拉取脚本：{}", target.pull_landing_name());
     println!("  交付编码：{}", enc.encoder().name());
     println!("━━━━━━━━━━━━━━━━━━━━");
 
@@ -796,12 +858,6 @@ fn run_deploy(args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
         }
     }
 
-    let interval = if args.dry_run { 0u64 } else { args.interval };
-    let suffix = enc.encoder().suffix();
-    let encoded_file = format!("{landing}.{suffix}");
-    let cat_script = enc.encoder().encode(script.as_bytes());
-    let cmd = decode_cmd_for_shell(args.shell, enc, &encoded_file, landing);
-
     let mut backend = prepare_input(stop)?;
     let mut send_char = |ch| {
         if args.dry_run {
@@ -811,34 +867,23 @@ fn run_deploy(args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
         }
     };
 
-    // 输入 heredoc 头。
-    type_command(
-        &heredoc_header(args.shell, &encoded_file),
-        interval,
-        &mut send_char,
+    deploy_one_script(
+        target.script(),
+        target.landing_name(),
+        args,
         stop,
-    );
-
-    // 输入编码后的脚本。
-    type_text(
-        &cat_script,
-        interval,
         &mut send_char,
-        WRAP_EVERY,
+    )?;
+    deploy_one_script(
+        target.pull_script(),
+        target.pull_landing_name(),
+        args,
         stop,
-        args.dry_run,
-    );
-
-    // 输入 heredoc 尾并执行解码命令。
-    type_command(
-        &format!("{}\n{cmd}\n", heredoc_footer(args.shell, &encoded_file)),
-        interval,
         &mut send_char,
-        stop,
-    );
+    )?;
 
     if !args.dry_run {
-        println!("\n✅ 已部署 {landing}（目标机）");
+        println!("\n✅ 已部署脚本（目标机）");
     }
     std::mem::forget(backend); // 跳过 enigo Drop（其 Drop 中 thread::sleep 会累积阻塞）
     Ok(())
@@ -946,6 +991,8 @@ mod tests {
             pull_chunk_size: 1024,
             pull_max_retry: 5,
             pull_region: false,
+            pull_char_space: true,
+            pull_line_width: 50,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "bash typepaste-restore.sh uid.b32 md5");
@@ -972,6 +1019,8 @@ mod tests {
             pull_chunk_size: 1024,
             pull_max_retry: 5,
             pull_region: false,
+            pull_char_space: true,
+            pull_line_width: 50,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "myrestore.sh uid.b32 md5");
@@ -998,6 +1047,8 @@ mod tests {
             pull_chunk_size: 1024,
             pull_max_retry: 5,
             pull_region: false,
+            pull_char_space: true,
+            pull_line_width: 50,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
         assert_eq!(cmd, "powershell -File typepaste-restore.ps1 uid.b32 md5");
@@ -1096,6 +1147,8 @@ mod tests {
             pull_chunk_size: 1024,
             pull_max_retry: 5,
             pull_region: false,
+            pull_char_space: true,
+            pull_line_width: 50,
         };
         // 单次模式：不传 part_md5s
         let cmd = auto_invoke_command(&args, "uid.b32", "localmd5", None);

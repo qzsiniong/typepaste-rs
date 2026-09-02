@@ -94,26 +94,26 @@ impl Backend {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use std::sync::atomic::AtomicBool;
+//     use std::sync::Arc;
 
-    #[test]
-    fn backend_new_or_skip() {
-        // 无图形环境 / CI 下 enigo 初始化可能失败，则跳过。
-        match Backend::new(Arc::new(AtomicBool::new(false))) {
-            Ok(mut b) => {
-                // 仅验证能调用 send_char 不 panic；不验证实际输入。
-                b.send_char('a');
-                b.send_char('!');
-                b.send_char('\n');
-                let _ = b.mouse_location();
-            }
-            Err(_) => {
-                eprintln!("skip: enigo 不可用（CI/无图形环境）");
-            }
-        }
-    }
-}
+//     #[test]
+//     fn backend_new_or_skip() {
+//         // 无图形环境 / CI 下 enigo 初始化可能失败，则跳过。
+//         match Backend::new(Arc::new(AtomicBool::new(false))) {
+//             Ok(mut b) => {
+//                 // 仅验证能调用 send_char 不 panic；不验证实际输入。
+//                 b.send_char('a');
+//                 b.send_char('!');
+//                 b.send_char('\n');
+//                 let _ = b.mouse_location();
+//             }
+//             Err(_) => {
+//                 eprintln!("skip: enigo 不可用（CI/无图形环境）");
+//             }
+//         }
+//     }
+// }

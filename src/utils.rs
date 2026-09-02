@@ -2,9 +2,8 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::AtomicBool;
+use std::time::{Instant, SystemTime};
 use std::{eprintln, format};
 
 use glob::Pattern;
@@ -279,25 +278,6 @@ pub fn type_command<F: FnMut(char)>(
             std::thread::sleep(std::time::Duration::from_millis(interval));
         }
     }
-}
-
-/// 倒计时（秒）。期间可被 stop 中断。
-pub fn count_down(seconds: u64, stop: &Arc<AtomicBool>) {
-    if seconds == 0 {
-        return;
-    }
-    print!("{seconds} 秒后开始输入");
-    for n in (1..=seconds).rev() {
-        print!("\r{n} 秒后开始输入...  ");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        if stop.load(Ordering::Relaxed) {
-            println!();
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    println!("\r开始输入！              ");
 }
 
 #[cfg(test)]

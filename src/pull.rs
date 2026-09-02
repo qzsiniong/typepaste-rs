@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::ocr::{parse_file_info, parse_hex_chunk, screenshot_ocr_lines, select_region, Region};
+use crate::ocr::{
+    parse_file_info, parse_hex_chunk, retry_wait_ms, screenshot_ocr_with_check, select_region,
+    Region,
+};
 use crate::restore_script::Shell;
-use crate::utils::{count_down, md5_of_bytes};
+use crate::utils::md5_of_bytes;
 
 /// 反向传输参数。
 pub struct PullArgs {
@@ -37,6 +40,10 @@ pub struct PullArgs {
     pub select_region: bool,
     /// 截图区域（左上原点 points），为 None 时用窗口/全屏。
     pub region: Option<Region>,
+    /// 每个字符前加空格（提升 OCR 分割准确率）。
+    pub char_space: bool,
+    /// 分片显示每行字符数。
+    pub line_width: usize,
 }
 
 /// 反向传输主入口。
@@ -60,6 +67,11 @@ pub fn run_pull(
     println!("━━━ 反向传输（远程 → 本机）━━━");
     println!("  远程文件：{}", args.remote_path);
     println!("  分片大小：{} 字节", args.chunk_bytes);
+    println!("  每行宽度：{} 字符", args.line_width);
+    println!(
+        "  字符间距：{}",
+        if args.char_space { "开启" } else { "关闭" }
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     super_countdown(args.delay, stop);
@@ -73,6 +85,7 @@ pub fn run_pull(
 
     // 步骤 2：远程把文件转 base16 并按 chunk_bytes*2 字符/行切分
     prepare_remote_chunks(args, &mut type_command, stop)?;
+    std::thread::sleep(Duration::from_secs(3));
 
     let total_chunks = file_size.div_ceil(args.chunk_bytes);
     println!("共 {total_chunks} 片，开始逐片读取...");
@@ -141,39 +154,38 @@ fn probe_file_info(
     stop: &Arc<AtomicBool>,
 ) -> Result<(usize, String), String> {
     let path = &args.remote_path;
+    let space = if args.char_space { "1" } else { "0" };
     let cmd = match args.shell {
         Shell::Bash => {
             let q = quote(path);
-            format!(
-                "clear; stat -c%s {q}{path}{q} 2>/dev/null; stat -f%z {q}{path}{q} 2>/dev/null; md5sum {q}{path}{q} 2>/dev/null | cut -d' ' -f1\n"
-            )
+            format!("bash typepaste-pull.sh probe {q}{path}{q} {space}\n")
         }
         Shell::Powershell => {
             let q = quote_powershell(path);
-            format!(
-                "Clear-Host; (Get-Item {q}{path}{q}).Length; (Get-FileHash {q}{path}{q} -Algorithm MD5).Hash.ToLower()\n"
-            )
+            format!("powershell -File typepaste-pull.ps1 probe {q}{path}{q} {space}\n")
         }
     };
 
-    for attempt in 1..=args.max_retry {
-        type_command(&cmd, args.interval, stop);
-        std::thread::sleep(Duration::from_secs_f64(1.0));
-        let lines = screenshot_ocr_lines(args.region)?;
-        if let Some(info) = parse_file_info(&lines) {
-            return Ok(info);
+    type_command(&cmd, args.interval, stop);
+    std::thread::sleep(Duration::from_millis(2400));
+    for round in 1..=args.max_retry {
+        std::thread::sleep(Duration::from_millis(retry_wait_ms(round)));
+        let check = |lines: &[String]| parse_file_info(lines).is_some();
+        if let Some(lines) = screenshot_ocr_with_check(args.region, check)? {
+            if let Some(info) = parse_file_info(&lines) {
+                return Ok(info);
+            }
         }
-        eprintln!("  [探测] 第 {attempt} 次 OCR 未识别到文件信息，重试...");
-        eprintln!(
-            "    OCR 最后 6 行：{:?}",
-            lines.iter().rev().take(6).collect::<Vec<_>>()
-        );
-        // eprintln!("    截图已保存：{}", shot.display());
+        eprintln!("  [探测] 第 {round} 轮所有 OCR 组合均未识别到文件信息，重试...");
     }
     Err("探测文件信息失败（OCR 多次未识别）".to_string())
 }
 
 /// 在远程把文件编码为 base16 并按 chunk 切分到临时文件。
+/// 每行格式：`<hex_content> <md5>`，md5 在准备阶段一次性算好，读取时直接取用。
+///
+/// 已将内联命令提取到 typepaste-pull.sh / typepaste-pull.ps1，通过 --deploy-script 部署。
+/// 此处仅键入短命令调用脚本，减少键盘输入量。
 fn prepare_remote_chunks(
     args: &PullArgs,
     type_command: &mut impl FnMut(&str, u64, &AtomicBool),
@@ -184,22 +196,67 @@ fn prepare_remote_chunks(
     let cmd = match args.shell {
         Shell::Bash => {
             let q = quote(path);
-            let hex_width = chunk_bytes;
-            format!(
-                "if command -v xxd >/dev/null 2>&1; then xxd -p -c {hex_width} {q}{path}{q} > /tmp/tp_pull.b16; else python3 -c \"import sys;d=open(sys.argv[1],'rb').read();[print(d[i:i+{chunk_bytes}].hex()) for i in range(0,len(d),{chunk_bytes})]\" {q}{path}{q} > /tmp/tp_pull.b16; fi\n"
-            )
+            format!("bash typepaste-pull.sh prepare {q}{path}{q} {chunk_bytes}\n")
         }
         Shell::Powershell => {
             let q = quote_powershell(path);
-            format!(
-                "$b=[System.IO.File]::ReadAllBytes({q}{path}{q}); $sb=New-Object System.Text.StringBuilder; for($i=0;$i -lt $b.Length;$i+={chunk_bytes}){{ $null=$sb.AppendLine((-join ($b[$i..([Math]::Min($i+{chunk_bytes}-1,$b.Length-1))] | ForEach-Object {{ $_.ToString('x2') }})) }}; [System.IO.File]::WriteAllText('/tmp/tp_pull.b16',$sb.ToString())\n"
-            )
+            format!("powershell -File typepaste-pull.ps1 prepare {q}{path}{q} {chunk_bytes}\n")
         }
     };
     type_command(&cmd, args.interval, stop);
-    // 编码可能需要时间，等待
     std::thread::sleep(Duration::from_secs_f64(1.0));
     Ok(())
+}
+
+/// 调试：对比 OCR 识别结果与 resources/tp_pull.txt 中对应分片，打印逐字符差异。
+///
+/// `resources/tp_pull.txt` 的内容格式与远程 `/tmp/tp_pull.b16` 一致
+/// （每行：`<hex_content> <md5>`）。对比时仅取第一个字段（hex 内容）。
+/// 文件不存在或行数不足时静默跳过，不影响正常流程。
+/// `ocr_hex` 为 None 表示 OCR 未解析出有效 hex，仅打印期望内容。
+fn debug_chunk_diff(i: usize, ocr_hex: Option<&str>) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("tp_pull.txt");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let expected = match content.lines().nth(i - 1) {
+        Some(l) => l.split_whitespace().next().unwrap_or("").trim(),
+        None => return,
+    };
+
+    eprintln!("  [调试] 片 {i} 期望内容（resources/tp_pull.txt 第 {i} 行）:");
+    eprintln!("    期望({:>4}): {}", expected.len(), expected);
+
+    let actual = match ocr_hex {
+        Some(h) => h,
+        None => return,
+    };
+    if actual == expected {
+        eprintln!("    实际与期望一致");
+        return;
+    }
+    eprintln!("    实际({:>4}): {}", actual.len(), actual);
+
+    // 逐字符差异标记：相同位置为空格，不同为 ^
+    let max_len = expected.len().max(actual.len());
+    let mut diff = String::with_capacity(max_len);
+    let mut diff_count = 0usize;
+    let e_chars: Vec<char> = expected.chars().collect();
+    let a_chars: Vec<char> = actual.chars().collect();
+    for idx in 0..max_len {
+        let e = e_chars.get(idx);
+        let a = a_chars.get(idx);
+        match (e, a) {
+            (Some(e), Some(a)) if e == a => diff.push(' '),
+            _ => {
+                diff.push('^');
+                diff_count += 1;
+            }
+        }
+    }
+    eprintln!("    差异({:>4}): {}", diff_count, diff);
 }
 
 /// 读取第 i 片，带重试。
@@ -209,39 +266,38 @@ fn read_chunk_with_retry(
     type_command: &mut impl FnMut(&str, u64, &AtomicBool),
     stop: &Arc<AtomicBool>,
 ) -> Result<String, String> {
+    let space = if args.char_space { "1" } else { "0" };
+    let lw = args.line_width;
     let cmd = match args.shell {
-        Shell::Bash => format!(
-            "clear; sleep .5; sed -n '{i}p' /tmp/tp_pull.b16 | sed -E 's/.{{50}}/&\\n/g'; sed -n '{i}p' /tmp/tp_pull.b16 | tr -d '\\n' | md5sum | cut -d' ' -f1\n",
-        ),
+        Shell::Bash => {
+            format!("bash typepaste-pull.sh show {i} {lw} {space}\n")
+        }
         Shell::Powershell => {
-            let idx = i - 1;
-            format!(
-                "Clear-Host; $l=(Get-Content /tmp/tp_pull.b16)[{idx}]; ($l -replace '(.{{50}})', ('$1' + \"`n\")); ($l -replace '\\r|\\n','') | ForEach-Object {{ (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($_))) -Algorithm MD5).Hash.ToLower() }}\n"
-            )
+            format!("powershell -File typepaste-pull.ps1 show {i} {lw} {space}\n")
         }
     };
 
     type_command(&cmd, args.interval, stop);
-    std::thread::sleep(Duration::from_secs_f64(1.0));
-    for attempt in 1..=args.max_retry {
+    std::thread::sleep(Duration::from_millis(1500));
+    for round in 1..=args.max_retry {
         if stop.load(Ordering::Relaxed) {
             return Err("已停止".to_string());
         }
-        std::thread::sleep(Duration::from_millis(500));
-        let lines = screenshot_ocr_lines(args.region)?;
-        if let Some((hex, md5)) = parse_hex_chunk(&lines) {
-            let actual = md5_of_bytes(hex.as_bytes());
-            if actual == md5 {
+        std::thread::sleep(Duration::from_millis(retry_wait_ms(round)));
+        let check = |lines: &[String]| {
+            parse_hex_chunk(lines)
+                .map(|(hex, md5)| md5_of_bytes(hex.as_bytes()) == md5)
+                .unwrap_or(false)
+        };
+        match screenshot_ocr_with_check(args.region, check)? {
+            Some(lines) => {
+                let (hex, _) = parse_hex_chunk(&lines).unwrap();
                 return Ok(hex);
             }
-            eprintln!("  [片 {i}] md5 不匹配（第 {attempt} 次），重试...");
-            eprintln!("    got={actual} want={md5}");
-        } else {
-            eprintln!("  [片 {i}] OCR 未识别（第 {attempt} 次），重试...");
-            eprintln!(
-                "    OCR 最后 4 行：{:?}",
-                lines.iter().rev().take(4).collect::<Vec<_>>()
-            );
+            None => {
+                eprintln!("  [片 {i}] 第 {round} 轮所有 OCR 组合均失败，重试...");
+                debug_chunk_diff(i, None);
+            }
         }
     }
     Err(format!("片 {i} 读取失败（重试 {0} 次）", args.max_retry))
@@ -280,14 +336,35 @@ fn make_pull_progress(total: u64) -> ProgressBar {
 
 /// dry-run：打印将要执行的命令序列。
 fn dry_run_pull(args: &PullArgs) -> Result<(), String> {
+    let space = if args.char_space { "1" } else { "0" };
+    let script = match args.shell {
+        Shell::Bash => "bash typepaste-pull.sh",
+        Shell::Powershell => "powershell -File typepaste-pull.ps1",
+    };
+    let q = match args.shell {
+        Shell::Bash => quote(&args.remote_path),
+        Shell::Powershell => quote_powershell(&args.remote_path),
+    };
     println!("[dry-run] 反向传输：{} → 本地", args.remote_path);
-    println!("  [探测] stat + md5sum");
+    println!("  [探测] {script} probe {q}{}{q} {space}", args.remote_path);
     println!(
-        "  [准备] xxd -p -c {} {} > /tmp/tp_pull.b16",
-        args.chunk_bytes * 2,
-        args.remote_path
+        "  [准备] {script} prepare {q}{}{q} {} → /tmp/tp_pull.b16（每行: content md5）",
+        args.remote_path, args.chunk_bytes
     );
-    println!("  [循环] 逐片 clear; sed + md5sum → 截图 OCR → 校验");
+    println!(
+        "  [循环] {script} show <i> {} {space} → 截图 OCR → 校验",
+        args.line_width
+    );
+    println!("  [每行宽度] {} 字符", args.line_width);
+    println!(
+        "  [字符间距] {}",
+        if args.char_space {
+            "开启（每字符前加空格）"
+        } else {
+            "关闭"
+        }
+    );
     println!("  [重组] hex decode → 写文件 → md5 校验");
+    println!("  提示：脚本需先用 --deploy-script 部署到目标机。");
     Ok(())
 }
