@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::utils::md5_of_bytes;
@@ -50,7 +50,7 @@ const OCR_ENGINES: &[OcrEngine] = &[
 /// 每轮截图后依次尝试的目标宽度（像素）。
 ///
 /// 每个宽度只做一次图像缩放预处理，再依次用所有引擎识别，避免重复缩放。
-const OCR_WIDTHS: &[u32] = &[1000, 900, 1100, 1200, 1500];
+const OCR_WIDTHS: &[u32] = &[1000, 900, 1100];
 
 /// 每轮（所有组合失败后）的等待时间（毫秒），递减。
 ///
@@ -75,7 +75,7 @@ pub fn screenshot_ocr_with_check<F>(
     check: F,
 ) -> Result<Option<Vec<String>>, String>
 where
-    F: Fn(&[String]) -> bool + Sync,
+    F: Fn(&[String]) -> bool + Sync + Send + 'static,
 {
     #[cfg(target_os = "macos")]
     {
@@ -84,6 +84,7 @@ where
         screenshot(&tmp, region)?;
         eprintln!("    截图已保存: {}", tmp.display());
 
+        let check = Arc::new(check);
         for &target_width in OCR_WIDTHS {
             // 每个宽度只预处理（缩放）一次
             let proc_start = Instant::now();
@@ -98,55 +99,63 @@ where
                 "\n    目标宽度: {target_width}px（预处理 {:.0}ms）",
                 proc_start.elapsed().as_secs_f64() * 1000.0
             );
-            // 同一宽度下，各引擎并行识别；任一引擎 check 通过即返回，其余引擎收到信号后跳过。
-            let done = AtomicBool::new(false);
-            let result: Mutex<Option<Vec<String>>> = Mutex::new(None);
-            std::thread::scope(|s| {
-                let (proc_path, gray_img, done, result, check, ts) =
-                    (&proc_path, &gray_img, &done, &result, &check, &ts);
-                for &engine in OCR_ENGINES {
-                    s.spawn(move || {
-                        if done.load(Ordering::Relaxed) {
+            // 同一宽度下，各引擎并行识别；首个 check 通过的引擎立即通过 channel 返回，
+            // 其余引擎检测到 done 后不再写结果（其 OCR 仍在后台跑完，但不阻塞主线程）。
+            let done = Arc::new(AtomicBool::new(false));
+            let proc_path = Arc::new(proc_path);
+            let gray_img = Arc::new(gray_img);
+            let (tx, rx) = mpsc::channel::<Vec<String>>();
+
+            let mut handles = Vec::new();
+            for &engine in OCR_ENGINES {
+                let tx = tx.clone();
+                let done = done.clone();
+                let proc_path = proc_path.clone();
+                let gray_img = gray_img.clone();
+                let check = check.clone();
+                handles.push(std::thread::spawn(move || {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let ocr_start = Instant::now();
+                    let text = match ocr_with_engine(&proc_path, &gray_img, engine) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!(
+                                "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
+                                engine.name(),
+                                ocr_start.elapsed().as_secs_f64() * 1000.0
+                            );
                             return;
                         }
-                        let ocr_start = Instant::now();
-                        let text = match ocr_with_engine(proc_path, gray_img, engine) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                eprintln!(
-                                    "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
-                                    engine.name(),
-                                    ocr_start.elapsed().as_secs_f64() * 1000.0
-                                );
-                                return;
-                            }
-                        };
-                        eprintln!(
-                            "    引擎 {} 完成（{:.0}ms）",
-                            engine.name(),
-                            ocr_start.elapsed().as_secs_f64() * 1000.0
-                        );
+                    };
+                    eprintln!(
+                        "    引擎 {} 完成（{:.0}ms）",
+                        engine.name(),
+                        ocr_start.elapsed().as_secs_f64() * 1000.0
+                    );
 
-                        // 保存本次成功的 OCR 结果，方便调试
-                        let ocr = std::env::temp_dir()
-                            .join(format!("tp_pull_{ts}_{}.ocr", engine.name()));
-                        let _ = std::fs::write(&ocr, &text);
-                        eprintln!("    OCR 结果已保存: {}", ocr.display());
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                    if check(&lines) {
+                        eprintln!("    引擎 {} 通过 check", engine.name());
+                        done.store(true, Ordering::Relaxed);
+                        let _ = tx.send(lines);
+                    }
+                }));
+            }
+            drop(tx);
 
-                        if done.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-                        if check(&lines) {
-                            done.store(true, Ordering::Relaxed);
-                            *result.lock().unwrap() = Some(lines);
-                        }
-                    });
+            match rx.recv() {
+                Ok(lines) => return Ok(Some(lines)),
+                Err(_) => {
+                    // 所有引擎均未通过 check，等待线程结束后尝试下一宽度
+                    for h in handles {
+                        let _ = h.join();
+                    }
                 }
-            });
-
-            if let Some(lines) = result.into_inner().unwrap() {
-                return Ok(Some(lines));
             }
         }
         Ok(None)
