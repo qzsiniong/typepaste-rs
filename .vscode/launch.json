@@ -129,7 +129,10 @@
 				// "./resources/test.jpg",
 				"--pull-region",
 				"--pull-chunk-size",
-				"100",
+				"200",
+				"--pull-max-retry",
+				"3",
+				// "--pull-char-space",
 			],
 			"cwd": "${workspaceFolder}"
 		},

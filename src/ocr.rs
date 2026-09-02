@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -74,7 +75,7 @@ pub fn screenshot_ocr_with_check<F>(
     check: F,
 ) -> Result<Option<Vec<String>>, String>
 where
-    F: Fn(&[String]) -> bool,
+    F: Fn(&[String]) -> bool + Sync,
 {
     #[cfg(target_os = "macos")]
     {
@@ -97,34 +98,55 @@ where
                 "\n    目标宽度: {target_width}px（预处理 {:.0}ms）",
                 proc_start.elapsed().as_secs_f64() * 1000.0
             );
-            for &engine in OCR_ENGINES {
-                let ocr_start = Instant::now();
-                let text = match ocr_with_engine(&proc_path, &gray_img, engine) {
-                    Ok(t) => t,
-                    Err(e) => {
+            // 同一宽度下，各引擎并行识别；任一引擎 check 通过即返回，其余引擎收到信号后跳过。
+            let done = AtomicBool::new(false);
+            let result: Mutex<Option<Vec<String>>> = Mutex::new(None);
+            std::thread::scope(|s| {
+                let (proc_path, gray_img, done, result, check, ts) =
+                    (&proc_path, &gray_img, &done, &result, &check, &ts);
+                for &engine in OCR_ENGINES {
+                    s.spawn(move || {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let ocr_start = Instant::now();
+                        let text = match ocr_with_engine(proc_path, gray_img, engine) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!(
+                                    "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
+                                    engine.name(),
+                                    ocr_start.elapsed().as_secs_f64() * 1000.0
+                                );
+                                return;
+                            }
+                        };
                         eprintln!(
-                            "    引擎 {} 失败（{:.0}ms）：{e}，跳过",
+                            "    引擎 {} 完成（{:.0}ms）",
                             engine.name(),
                             ocr_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        continue;
-                    }
-                };
-                eprintln!(
-                    "    引擎 {} 完成（{:.0}ms）",
-                    engine.name(),
-                    ocr_start.elapsed().as_secs_f64() * 1000.0
-                );
 
-                // 保存本次成功的 OCR 结果，方便调试
-                let ocr = std::env::temp_dir().join(format!("tp_pull_{ts}_{}.ocr", engine.name()));
-                let _ = std::fs::write(&ocr, &text);
-                eprintln!("    OCR 结果已保存: {}", ocr.display());
+                        // 保存本次成功的 OCR 结果，方便调试
+                        let ocr = std::env::temp_dir()
+                            .join(format!("tp_pull_{ts}_{}.ocr", engine.name()));
+                        let _ = std::fs::write(&ocr, &text);
+                        eprintln!("    OCR 结果已保存: {}", ocr.display());
 
-                let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-                if check(&lines) {
-                    return Ok(Some(lines));
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                        if check(&lines) {
+                            done.store(true, Ordering::Relaxed);
+                            *result.lock().unwrap() = Some(lines);
+                        }
+                    });
                 }
+            });
+
+            if let Some(lines) = result.into_inner().unwrap() {
+                return Ok(Some(lines));
             }
         }
         Ok(None)
