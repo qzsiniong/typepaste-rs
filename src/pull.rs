@@ -98,7 +98,12 @@ pub fn run_pull(
             pb.finish_and_clear();
             return Ok(());
         }
-        let chunk_hex = read_chunk_with_retry(i, args, &mut type_command, stop)?;
+        let chunk_i_bytes = if i == total_chunks {
+            file_size - (i - 1) * args.chunk_bytes
+        } else {
+            args.chunk_bytes
+        };
+        let chunk_hex = read_chunk_with_fallback(i, chunk_i_bytes, args, &mut type_command, stop)?;
         all_hex.push_str(&chunk_hex);
         pb.inc(1);
     }
@@ -113,13 +118,16 @@ pub fn run_pull(
         ));
     }
 
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
+
     let out_path = match &args.local_out {
         Some(p) => p.clone(),
         None => PathBuf::from(
             Path::new(&args.remote_path)
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "pulled_file".to_string()),
+                // tp_pulled_  + 年月日时分秒 + 远程文件名
+                .map(|n| format!("tp_pulled_{}_{}", ts, n.to_string_lossy().to_string(),))
+                .unwrap_or_else(|| format!("tp_pulled_file_{}", ts)),
         ),
     };
     std::fs::write(&out_path, &bytes).map_err(|e| format!("写入本地文件失败：{e}"))?;
@@ -260,20 +268,33 @@ fn debug_chunk_diff(i: usize, ocr_hex: Option<&str>) {
 }
 
 /// 读取第 i 片，带重试。
+///
+/// `b16_file` 为 None 时读取默认 `/tmp/tp_pull.b16`；为 Some 时读取指定文件
+/// （子分片回退时传入 `/tmp/tp_pull_sub.b16`）。
 fn read_chunk_with_retry(
     i: usize,
     args: &PullArgs,
     type_command: &mut impl FnMut(&str, u64, &AtomicBool),
     stop: &Arc<AtomicBool>,
+    b16_file: Option<&str>,
 ) -> Result<String, String> {
     let space = if args.char_space { "1" } else { "0" };
     let lw = args.line_width;
+    let file_arg = b16_file.unwrap_or("");
     let cmd = match args.shell {
         Shell::Bash => {
-            format!("bash typepaste-pull.sh show {i} {lw} {space}\n")
+            if file_arg.is_empty() {
+                format!("bash typepaste-pull.sh show {i} {lw} {space}\n")
+            } else {
+                format!("bash typepaste-pull.sh show {i} {lw} {space} {file_arg}\n")
+            }
         }
         Shell::Powershell => {
-            format!("powershell -File typepaste-pull.ps1 show {i} {lw} {space}\n")
+            if file_arg.is_empty() {
+                format!("powershell -File typepaste-pull.ps1 show {i} {lw} {space}\n")
+            } else {
+                format!("powershell -File typepaste-pull.ps1 show {i} {lw} {space} {file_arg}\n")
+            }
         }
     };
 
@@ -301,6 +322,81 @@ fn read_chunk_with_retry(
         }
     }
     Err(format!("片 {i} 读取失败（重试 {0} 次）", args.max_retry))
+}
+
+/// 子分片回退的最小字节数。
+const MIN_SUB_CHUNK_BYTES: usize = 16;
+
+/// 读取第 i 片：先常规重试，失败后渐进式切分为更小的子分片重试。
+///
+/// `chunk_i_bytes` 为该片的实际字节数（末分片可能小于 `chunk_bytes`）。
+/// 子分片大小从 `chunk_bytes / 2` 开始二分递减，直到小于 `MIN_SUB_CHUNK_BYTES`
+/// 或不小于该片实际大小。
+fn read_chunk_with_fallback(
+    i: usize,
+    chunk_i_bytes: usize,
+    args: &PullArgs,
+    type_command: &mut impl FnMut(&str, u64, &AtomicBool),
+    stop: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    // 1. 常规读取
+    match read_chunk_with_retry(i, args, type_command, stop, None) {
+        Ok(hex) => return Ok(hex),
+        Err(e) => {
+            eprintln!("  [片 {i}] 常规读取失败：{e}，尝试切分为更小分片...");
+        }
+    }
+
+    // 2. 渐进式子分片回退
+    let mut sub_bytes = args.chunk_bytes / 2;
+    while sub_bytes >= MIN_SUB_CHUNK_BYTES && sub_bytes < chunk_i_bytes {
+        match read_chunk_with_subsplit(i, chunk_i_bytes, sub_bytes, args, type_command, stop) {
+            Ok(hex) => {
+                eprintln!("  [片 {i}] 子分片（{sub_bytes}B）读取成功");
+                return Ok(hex);
+            }
+            Err(e) => {
+                eprintln!("  [片 {i}] 子分片（{sub_bytes}B）失败：{e}，尝试更小粒度...");
+                sub_bytes /= 2;
+            }
+        }
+    }
+
+    Err(format!("片 {i} 读取失败（常规重试 + 子分片回退均失败）"))
+}
+
+/// 将第 i 片按 `sub_bytes` 切分为子分片并逐一读取，拼接后返回该片完整 hex。
+fn read_chunk_with_subsplit(
+    i: usize,
+    chunk_i_bytes: usize,
+    sub_bytes: usize,
+    args: &PullArgs,
+    type_command: &mut impl FnMut(&str, u64, &AtomicBool),
+    stop: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    // 远程生成子分片文件 /tmp/tp_pull_sub.b16
+    let cmd = match args.shell {
+        Shell::Bash => format!("bash typepaste-pull.sh subchunk {i} {sub_bytes}\n"),
+        Shell::Powershell => {
+            format!("powershell -File typepaste-pull.ps1 subchunk {i} {sub_bytes}\n")
+        }
+    };
+    type_command(&cmd, args.interval, stop);
+    std::thread::sleep(Duration::from_secs_f64(1.0));
+
+    let sub_count = chunk_i_bytes.div_ceil(sub_bytes);
+    eprintln!("  [片 {i}] 切分为 {sub_count} 个子分片（每片 {sub_bytes}B）");
+
+    let mut all_sub = String::with_capacity(chunk_i_bytes * 2);
+    for j in 1..=sub_count {
+        if stop.load(Ordering::Relaxed) {
+            return Err("已停止".to_string());
+        }
+        let sub_hex =
+            read_chunk_with_retry(j, args, type_command, stop, Some("/tmp/tp_pull_sub.b16"))?;
+        all_sub.push_str(&sub_hex);
+    }
+    Ok(all_sub)
 }
 
 /// hex 字符串解码为字节。

@@ -2,9 +2,10 @@
 # Usage:
 #   powershell -File typepaste-pull.ps1 probe <path> <char_space>
 #   powershell -File typepaste-pull.ps1 prepare <path> <chunk_bytes>
-#   powershell -File typepaste-pull.ps1 show <index> <line_width> <char_space>
+#   powershell -File typepaste-pull.ps1 show <index> <line_width> <char_space> [file]
+#   powershell -File typepaste-pull.ps1 subchunk <index> <sub_chunk_bytes>
 # char_space=1 表示每字符前加空格（提升 OCR 分割），0 表示关闭。
-param([Parameter(Mandatory=$true)][string]$Action, [string]$Arg1, [string]$Arg2, [string]$Arg3)
+param([Parameter(Mandatory=$true)][string]$Action, [string]$Arg1, [string]$Arg2, [string]$Arg3, [string]$Arg4)
 
 function Probe-File([string]$path, [bool]$charSpace) {
   Clear-Host
@@ -37,11 +38,11 @@ function Prepare-Chunks([string]$path, [int]$chunkBytes) {
   [System.IO.File]::WriteAllText('/tmp/tp_pull.b16', $sb.ToString())
 }
 
-function Show-Chunk([int]$index, [int]$lineWidth, [bool]$charSpace) {
+function Show-Chunk([int]$index, [int]$lineWidth, [bool]$charSpace, [string]$file = '/tmp/tp_pull.b16') {
   Clear-Host
   Write-Output ''
   Start-Sleep -Milliseconds 500
-  $line = (Get-Content /tmp/tp_pull.b16)[$index - 1]
+  $line = (Get-Content $file)[$index - 1]
   $parts = $line -split ' '
   $hex = $parts[0]
   $md5 = $parts[1]
@@ -54,9 +55,25 @@ function Show-Chunk([int]$index, [int]$lineWidth, [bool]$charSpace) {
   Write-Output $md5
 }
 
+function Subchunk-Chunk([int]$index, [int]$subBytes) {
+  $line = (Get-Content '/tmp/tp_pull.b16')[$index - 1]
+  $hex = ($line -split ' ')[0]
+  $subChars = $subBytes * 2
+  $md5 = [System.Security.Cryptography.MD5]::Create()
+  $sb = New-Object System.Text.StringBuilder
+  for ($i = 0; $i -lt $hex.Length; $i += $subChars) {
+    $end = [Math]::Min($i + $subChars, $hex.Length)
+    $sub = $hex.Substring($i, $end - $i)
+    $h = [BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sub))).Replace('-', '').ToLower()
+    $null = $sb.AppendLine("$sub $h")
+  }
+  [System.IO.File]::WriteAllText('/tmp/tp_pull_sub.b16', $sb.ToString())
+}
+
 switch ($Action) {
   'probe' { Probe-File $Arg1 ($Arg2 -eq '1') }
   'prepare' { Prepare-Chunks $Arg1 ([int]$Arg2) }
-  'show' { Show-Chunk ([int]$Arg1) ([int]$Arg2) ($Arg3 -eq '1') }
-  default { Write-Error "Usage: $($MyInvocation.MyCommand.Name) {probe|prepare|show} ..."; exit 1 }
+  'show' { Show-Chunk ([int]$Arg1) ([int]$Arg2) ($Arg3 -eq '1') $Arg4 }
+  'subchunk' { Subchunk-Chunk ([int]$Arg1) ([int]$Arg2) }
+  default { Write-Error "Usage: $($MyInvocation.MyCommand.Name) {probe|prepare|show|subchunk} ..."; exit 1 }
 }

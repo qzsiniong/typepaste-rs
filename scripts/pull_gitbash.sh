@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # typepaste pull (gitbash) — Windows Git Bash，GNU 工具，xxd 可能缺失用 python3 回退。
 # Usage:
-#   bash typepaste-pull.sh probe <path>                       # 输出: <size> <md5>
+#   bash typepaste-pull.sh probe <path>                       # 输出: <size> <md5> <checksum>
 #   bash typepaste-pull.sh prepare <path> <chunk_bytes>       # 生成 /tmp/tp_pull.b16（每行: hex md5）
-#   bash typepaste-pull.sh show <index> <line_width> <space>  # 清屏并显示第 index 片
+#   bash typepaste-pull.sh show <index> <line_width> <space> [file]  # 清屏并显示第 index 片
+#   bash typepaste-pull.sh subchunk <index> <sub_chunk_bytes> # 将第 index 片切为更小的子分片 → /tmp/tp_pull_sub.b16
 # space=1 表示每字符前加空格（提升 OCR 分割），0 表示仅首字符前加空格。
 set -e
 
@@ -61,6 +62,7 @@ show() {
   local i="$1"
   local lw="$2"
   local space="$3"
+  local file="${4:-/tmp/tp_pull.b16}"
   local space_sed
   if [ "$space" = "1" ]; then
     space_sed='s/./ &/g'
@@ -70,13 +72,37 @@ show() {
   clear || true
   sleep .1
   echo
-  sed -n "${i}p" /tmp/tp_pull.b16 | awk '{print $1}' | sed -E "s/.{$lw}/&\n/g" | sed -E "$space_sed"
-  sed -n "${i}p" /tmp/tp_pull.b16 | awk '{print $2}' | sed -E "$space_sed"
+  sed -n "${i}p" "$file" | awk '{print $1}' | sed -E "s/.{$lw}/&\n/g" | sed -E "$space_sed"
+  sed -n "${i}p" "$file" | awk '{print $2}' | sed -E "$space_sed"
+}
+
+subchunk() {
+  local i="$1"
+  local sub_bytes="$2"
+  local sub_chars=$((sub_bytes * 2))
+  # 读取第 i 行的 hex 内容
+  local hex
+  hex=$(sed -n "${i}p" /tmp/tp_pull.b16 | awk '{print $1}')
+  # 按 sub_chars 字符切分，每片追加 md5，写入 /tmp/tp_pull_sub.b16
+  : > /tmp/tp_pull_sub.b16
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$hex" | perl -MDigest::MD5 -ne 'chomp;my $n='"$sub_chars"';while(length($_)>0){my $s=substr($_,0,$n,"");print "$s ",Digest::MD5::md5_hex($s),"\n"}' > /tmp/tp_pull_sub.b16
+  else
+    python3 -c "
+import sys,hashlib
+h=sys.argv[1];n=int(sys.argv[2])
+with open('/tmp/tp_pull_sub.b16','w') as f:
+    for i in range(0,len(h),n):
+        s=h[i:i+n]
+        f.write(f'{s} {hashlib.md5(s.encode()).hexdigest()}\n')
+" "$hex" "$sub_chars"
+  fi
 }
 
 case "$1" in
   probe) probe "$2" "$3" ;;
   prepare) prepare "$2" "$3" ;;
-  show) show "$2" "$3" "$4" ;;
-  *) echo "Usage: $0 {probe|prepare|show} ..." >&2; exit 1 ;;
+  show) show "$2" "$3" "$4" "$5" ;;
+  subchunk) subchunk "$2" "$3" ;;
+  *) echo "Usage: $0 {probe|prepare|show|subchunk} ..." >&2; exit 1 ;;
 esac

@@ -1,3 +1,4 @@
 /target/
+/playground/
 .DS_Store
 *.tmp
