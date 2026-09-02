@@ -373,8 +373,9 @@ fn preprocess_image(path: &Path, target_width: u32) -> Result<(PathBuf, image::G
 
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S%f").to_string();
     let proc_path = std::env::temp_dir().join(format!("tp_ocr_proc_{ts}.png"));
-    processed
-        .save(&proc_path)
+    // 保存纯灰度图（Luma8，无 alpha 通道），避免 leptonica 读取时做
+    // gray+alpha → RGBA 转换并输出 "Info in pixReadStreamPng" 噪音。
+    gray.save(&proc_path)
         .map_err(|e| format!("预处理图片保存失败：{e}"))?;
     debug!("预处理图片已保存: {}", proc_path.display());
     Ok((proc_path, gray))
