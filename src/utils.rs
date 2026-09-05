@@ -335,6 +335,44 @@ pub fn type_text<F: FnMut(char)>(
     start.elapsed().as_secs_f64()
 }
 
+/// 逐字符模拟键盘输入，带 indicatif 进度条；每字符前调用 `abort`，
+/// 返回 true 表示已全部输入，false 表示中途中止（失焦/远端暂停等）。
+///
+/// 中止时立即停止调用 `send_char`（最多多打 1 个字符），清理进度条后返回，
+/// 由调用方等待恢复后重发整帧（接收端以 Ctrl+A 丢弃半帧）。不换行、不 dry-run。
+pub fn type_text_abortable<F: FnMut(char)>(
+    text: &str,
+    interval: u64,
+    send_char: &mut F,
+    abort: &dyn Fn() -> bool,
+) -> bool {
+    let total = text.chars().count();
+    let pb = make_progress_bar(total as u64);
+    set_global_pb(Some(pb.clone()));
+
+    for (i, ch) in text.chars().enumerate() {
+        if abort() {
+            pb.finish_and_clear();
+            set_global_pb(None);
+            return false;
+        }
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_char(ch))) {
+            pb.abandon();
+            set_global_pb(None);
+            error!("\n输入失败（第 {}/{} 字符 '{}'）：{:?}", i + 1, total, ch, e);
+            error!("   可能原因：辅助功能权限被撤销、目标窗口失焦、后端异常");
+            std::process::exit(1);
+        }
+        if interval > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(interval));
+        }
+        pb.inc(1);
+    }
+    pb.finish();
+    set_global_pb(None);
+    true
+}
+
 /// 逐字输入命令字符串（无进度条），用于 cat 头/EOF/调用命令。
 /// `interval` 单位为毫秒。stop 检查由 backend.send_char 负责。
 pub fn type_command<F: FnMut(char)>(

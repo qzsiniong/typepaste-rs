@@ -59,8 +59,8 @@ pub fn run_pull(
 
     // 交互式框选截图区域
     if args.select_region && args.region.is_none() {
-        println!("  请在屏幕上框选终端输出区域（Esc 取消）...");
-        let region = select_region()?;
+        println!("  请在屏幕上框选终端输出区域(Esc 取消)...");
+        let region = select_region("拖拽框选终端输出区域，Esc 取消")?;
         args.region = Some(region);
         println!("  截图区域：{region:?}");
     }

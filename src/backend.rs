@@ -92,6 +92,53 @@ impl Backend {
     pub fn mouse_location(&self) -> Option<(i32, i32)> {
         self.enigo.location().ok()
     }
+
+    /// 发送 Ctrl+<字母> 组合键（真实修饰键 press/release）。
+    ///
+    /// 用于网页接收端协议定界：Ctrl+B=STX（帧开始）、Ctrl+C=ETX（帧结束）、
+    /// Ctrl+A=RESET（清空远端缓冲）。网页 keydown 监听 `ctrlKey+key` 并 preventDefault。
+    fn ctrl_click(&mut self, letter: char) {
+        if self.stop.load(Ordering::Relaxed) {
+            std::process::exit(130);
+        }
+        let _ = self.enigo.key(Key::Control, Direction::Press);
+        shift_settle();
+        // 小写字母走物理键：macOS 用 raw keycode，其余平台 Unicode 点击。
+        if let Some(KeyAction::Char {
+            #[allow(unused_variables)]
+            base,
+            shift: false,
+            #[allow(unused_variables)]
+            mac_keycode,
+        }) = get_key_info(letter)
+        {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = self.enigo.raw(mac_keycode, Direction::Click);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = self.enigo.key(Key::Unicode(base), Direction::Click);
+            }
+        }
+        let _ = self.enigo.key(Key::Control, Direction::Release);
+        shift_settle();
+    }
+
+    /// STX：帧开始（Ctrl+B）。
+    pub fn send_stx(&mut self) {
+        self.ctrl_click('b');
+    }
+
+    /// ETX：帧结束（Ctrl+C）。
+    pub fn send_etx(&mut self) {
+        self.ctrl_click('c');
+    }
+
+    /// RESET：清空网页接收端当前帧缓冲（Ctrl+A）。
+    pub fn send_reset(&mut self) {
+        self.ctrl_click('a');
+    }
 }
 
 // #[cfg(test)]

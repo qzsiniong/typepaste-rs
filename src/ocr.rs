@@ -173,7 +173,7 @@ where
 /// 若 `region = Some((x,y,w,h))`，只截该矩形区域（左上原点，points）；
 /// 否则优先截前台窗口，失败回退全屏。
 #[cfg(target_os = "macos")]
-fn screenshot(path: &Path, region: Option<Region>) -> Result<(), String> {
+pub fn screenshot(path: &Path, region: Option<Region>) -> Result<(), String> {
     if let Some((x, y, w, h)) = region {
         let rect = format!("{x},{y},{w},{h}");
         let status = Command::new("screencapture")
@@ -223,34 +223,183 @@ fn frontmost_window_id() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// 本机前台 App 焦点监视器（macOS）。
+///
+/// 常驻一个 Swift 进程，通过 `NSWorkspace.didActivateApplicationNotification`
+/// 事件驱动地报告前台 App 变化（无轮询、延迟约几十毫秒）。传输开始时前台 App
+/// 为基线（VDI 客户端）；打字循环每字符检查 `is_focused()`，一旦用户切走
+/// 立即停止输入，避免键盘命令打到其他窗口产生脏数据。
+#[cfg(target_os = "macos")]
+pub struct FocusMonitor {
+    focused: Arc<AtomicBool>,
+    child: Mutex<Option<std::process::Child>>,
+}
+
+#[cfg(target_os = "macos")]
+impl FocusMonitor {
+    /// 启动监视器：以当前前台 App 为基线，之后前台 App 变化即失焦。
+    pub fn start() -> Result<Self, String> {
+        let swift_code = r#"
+import AppKit
+let ws = NSWorkspace.shared
+if let f = ws.frontmostApplication {
+    print("BASE:" + (f.bundleIdentifier ?? ""))
+    fflush(stdout)
+}
+ws.notificationCenter.addObserver(
+    forName: NSWorkspace.didActivateApplicationNotification,
+    object: nil, queue: nil) { note in
+    if let a = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+        print("ACT:" + (a.bundleIdentifier ?? ""))
+        fflush(stdout)
+    }
+}
+RunLoop.main.run()
+"#;
+        let mut child = Command::new("swift")
+            .args(["-e", swift_code])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("焦点监视器启动失败：{e}"))?;
+        let stdout = child.stdout.take().ok_or("焦点监视器无 stdout")?;
+        // Rust 端立即捕获基线前台 App（osascript 约百毫秒），避免 swift 编译
+        // 启动（约数秒）期间基线缺失的盲区
+        let baseline_now = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"System Events\" to get bundle identifier of (first process whose frontmost is true)")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let focused = Arc::new(AtomicBool::new(true));
+        let f2 = focused.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            // 基线：优先 osascript 即时结果，swift 的 BASE 行作为确认/兜底
+            let mut baseline: Option<String> = baseline_now;
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(id) = line.strip_prefix("BASE:") {
+                    if baseline.is_none() {
+                        baseline = Some(id.to_string());
+                    }
+                    f2.store(true, Ordering::Relaxed);
+                } else if let Some(id) = line.strip_prefix("ACT:") {
+                    // 首次激活即基线（兜底 BASE 缺失）；与基线不同视为失焦
+                    if baseline.is_none() {
+                        baseline = Some(id.to_string());
+                    }
+                    f2.store(baseline.as_deref() == Some(id), Ordering::Relaxed);
+                }
+            }
+        });
+        Ok(FocusMonitor {
+            focused,
+            child: Mutex::new(Some(child)),
+        })
+    }
+
+    /// 前台 App 是否仍为传输开始时的基线 App。
+    pub fn is_focused(&self) -> bool {
+        self.focused.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FocusMonitor {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct FocusMonitor;
+
+#[cfg(not(target_os = "macos"))]
+impl FocusMonitor {
+    pub fn is_focused(&self) -> bool {
+        true
+    }
+}
+
 /// 交互式框选屏幕区域，返回 `(x,y,w,h)`（左上原点，points，全局屏幕坐标）。
 ///
-/// 启动 Swift 全屏半透明遮罩（覆盖所有显示器），用户拖拽选择矩形，
-/// 松开鼠标后输出坐标。坐标已转换为 `screencapture -R` 所需的全局屏幕坐标。
+/// 启动 Swift 全屏半透明遮罩（覆盖所有显示器）：拖拽框选后可拖角调整大小、
+/// 拖动内部移动、外部按下重选，回车/双击确认，Esc 取消。
+/// `hint` 为屏幕中心提示文本。坐标已转换为 `screencapture -R` 所需的全局屏幕坐标。
 #[cfg(target_os = "macos")]
-pub fn select_region() -> Result<Region, String> {
+pub fn select_region(hint: &str) -> Result<Region, String> {
     let swift_code = r#"
 import AppKit
 
-class RegionView: NSView {
-    var startPoint: NSPoint?   // 全局 AppKit 坐标（左下原点）
-    var currentPoint: NSPoint?
-    var onSelect: ((NSPoint, NSPoint) -> Void)?
+// 屏幕中心提示语（由 Rust 调用方注入，替换 __HINT__ 占位符）
+let hintText = "__HINT__"
 
-    // 将全局 AppKit 坐标转换为 screencapture 全局坐标（主屏幕左上原点，y 向下）
-    func toScreenCapture(_ p: NSPoint) -> NSPoint {
-        for screen in NSScreen.screens {
-            if NSPointInRect(p, screen.frame) {
-                let num = screen.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as! CGDirectDisplayID
-                let b = CGDisplayBounds(num)
-                let lx = p.x - screen.frame.origin.x
-                let lyTop = screen.frame.height - (p.y - screen.frame.origin.y)
-                return NSPoint(x: b.origin.x + lx, y: b.origin.y + lyTop)
-            }
-        }
-        if let m = NSScreen.main { return NSPoint(x: p.x, y: m.frame.height - p.y) }
-        return p
+// borderless 窗口默认 canBecomeKey=false，收不到键盘事件（Esc 取消无效）；
+// 子类化放开限制，并在窗口级直接响应 Esc，不依赖视图是否为第一响应者。
+class KeyWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { exit(0) } // Esc 取消
+        super.keyDown(with: event)
     }
+}
+
+// 交互模式：空闲 / 新建框选 / 移动选区 / 角点调整大小
+enum DragMode { case idle, creating, moving, resizing }
+
+// 选区状态在所有显示器视图间共享（坐标均为全局 AppKit 坐标）
+class SelectionState {
+    var a: NSPoint?
+    var b: NSPoint?
+    var selected = false        // 松开后选区已确定（可调整 / 按钮确认）
+    var mode: DragMode = .idle
+    var resizeCorner = -1       // 调整大小的角点索引（0左下 1右下 2右上 3左上）
+    var fixedPoint = NSPoint.zero  // 调整大小时固定的对角点（按下时记录，拖过对侧不翻转）
+    var dragAnchor = NSPoint.zero
+    var moveA0 = NSPoint.zero, moveB0 = NSPoint.zero  // 移动起始的两角
+    var onSelect: ((NSPoint, NSPoint) -> Void)?
+}
+
+// 全局 AppKit 坐标（左下原点）→ screencapture 全局坐标（主屏左上原点，y 向下）
+func globalToScreenCapture(_ p: NSPoint) -> NSPoint {
+    for screen in NSScreen.screens {
+        if NSPointInRect(p, screen.frame) {
+            let num = screen.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as! CGDirectDisplayID
+            let b = CGDisplayBounds(num)
+            let lx = p.x - screen.frame.origin.x
+            let lyTop = screen.frame.height - (p.y - screen.frame.origin.y)
+            return NSPoint(x: b.origin.x + lx, y: b.origin.y + lyTop)
+        }
+    }
+    if let m = NSScreen.main { return NSPoint(x: p.x, y: m.frame.height - p.y) }
+    return p
+}
+
+class RegionView: NSView {
+    let st: SelectionState
+    var hoverPoint: NSPoint?    // 本视图鼠标位置（全局），用于十字准线、坐标提示与聚焦边框
+    var tracking: NSTrackingArea?
+    var btnOK: NSButton!
+    var btnCancel: NSButton!
+
+    let handleHit: CGFloat = 12  // 角点吸附阈值（points）
+
+    init(frame: NSRect, st: SelectionState) {
+        self.st = st
+        super.init(frame: frame)
+        setupButtons()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
+
+    override var acceptsFirstResponder: Bool { true }
+    // 非激活 App 的首次点击直接投递到视图（否则首次点击只用于激活窗口，表现为「先点一下才能拖」）
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     func toGlobal(_ event: NSEvent) -> NSPoint {
         let win = window!
@@ -258,82 +407,362 @@ class RegionView: NSView {
                        y: win.frame.origin.y + event.locationInWindow.y)
     }
 
+    // 选区矩形（全局坐标）
+    func rectGlobal() -> NSRect? {
+        guard let a = st.a, let b = st.b else { return nil }
+        return NSRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+    // 四角（全局，AppKit 左下原点）：0左下 1右下 2右上 3左上
+    func corners(_ r: NSRect) -> [NSPoint] {
+        return [NSPoint(x: r.minX, y: r.minY), NSPoint(x: r.maxX, y: r.minY),
+                NSPoint(x: r.maxX, y: r.maxY), NSPoint(x: r.minX, y: r.maxY)]
+    }
+
+    func setupButtons() {
+        btnOK = NSButton(title: "确定", target: self, action: #selector(confirmBtn(_:)))
+        btnCancel = NSButton(title: "取消", target: self, action: #selector(cancelBtn(_:)))
+        for b in [btnOK, btnCancel] {
+            b!.bezelStyle = .rounded
+            b!.isHidden = true
+            addSubview(b!)
+        }
+    }
+    @objc func confirmBtn(_ sender: Any?) { confirm() }
+    @objc func cancelBtn(_ sender: Any?) { exit(0) }
+
+    // 按钮贴在选框下方（空间不足则上方）；选区不在本屏或正在拖拽时隐藏
+    func updateButtons() {
+        guard let win = window else { return }
+        var local = NSRect.zero
+        let show: Bool
+        if st.selected && st.mode == .idle, let r = rectGlobal() {
+            local = NSRect(x: r.minX - win.frame.origin.x, y: r.minY - win.frame.origin.y,
+                           width: r.width, height: r.height)
+            show = local.intersects(bounds)
+        } else {
+            show = false
+        }
+        btnOK.isHidden = !show
+        btnCancel.isHidden = !show
+        guard show else { return }
+        let h: CGFloat = 28, w: CGFloat = 84, gap: CGFloat = 10
+        let total = w * 2 + gap
+        var bx = local.midX - total / 2
+        bx = max(8, min(bx, bounds.width - total - 8))
+        var by = local.minY - 12 - h
+        if by < 8 { by = local.maxY + 12 }
+        if by + h > bounds.height - 8 { by = bounds.height - h - 8 }
+        btnCancel.frame = NSRect(x: bx, y: by, width: w, height: h)
+        btnOK.frame = NSRect(x: bx + w + gap, y: by, width: w, height: h)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         NSColor.black.withAlphaComponent(0.35).setFill()
         dirtyRect.fill()
-        guard let start = startPoint, let current = currentPoint else { return }
-        // 将全局坐标转回窗口坐标用于绘制
+
+        // 整屏边框：鼠标所在屏幕（或正在操作的屏幕）高亮聚焦，其余屏幕淡色边框
+        let focused = hoverPoint != nil || st.mode != .idle
+        let border = NSBezierPath(rect: bounds.insetBy(dx: focused ? 2 : 1, dy: focused ? 2 : 1))
+        border.lineWidth = focused ? 4 : 1
+        (focused ? NSColor.systemBlue : NSColor.white.withAlphaComponent(0.25)).setStroke()
+        border.stroke()
+
         let win = window!
         let toWin: (NSPoint) -> NSPoint = { p in
             NSPoint(x: p.x - win.frame.origin.x, y: p.y - win.frame.origin.y)
         }
-        let s = toWin(start), c = toWin(current)
-        let rect = NSRect(x: min(s.x, c.x), y: min(s.y, c.y),
-                          width: abs(c.x - s.x), height: abs(c.y - s.y))
-        NSColor.white.withAlphaComponent(0.15).setFill()
-        rect.fill()
-        NSColor.white.setStroke()
-        let path = NSBezierPath(rect: rect)
-        path.lineWidth = 1.5
-        path.stroke()
+
+        // 未开始任何框选前：每屏中心显示调用方提示语；一旦开始框选（st.a != nil）全部清除
+        if st.a == nil {
+            drawCenterHint(hintText)
+        }
+
+        // 十字准线：调整大小/移动中隐藏；光标在选区内部或边框/手柄上隐藏；其余显示
+        let crossPoint: NSPoint?
+        switch st.mode {
+        case .resizing, .moving: crossPoint = nil
+        case .creating: crossPoint = st.b
+        case .idle: crossPoint = hoverPoint
+        }
+        var crossHidden = false
+        if st.mode == .resizing || st.mode == .moving {
+            crossHidden = true
+        } else if let cp = crossPoint, st.selected, let r = rectGlobal() {
+            if NSPointInRect(cp, r)
+                || corners(r).contains(where: { hypot($0.x - cp.x, $0.y - cp.y) <= handleHit }) {
+                crossHidden = true
+            }
+        }
+        if !crossHidden, let cross = crossPoint {
+            let cp = toWin(cross)
+            NSColor.white.withAlphaComponent(0.6).setStroke()
+            let vline = NSBezierPath(); vline.lineWidth = 0.5
+            vline.move(to: NSPoint(x: cp.x, y: 0)); vline.line(to: NSPoint(x: cp.x, y: bounds.height))
+            vline.stroke()
+            let hline = NSBezierPath(); hline.lineWidth = 0.5
+            hline.move(to: NSPoint(x: 0, y: cp.y)); hline.line(to: NSPoint(x: bounds.width, y: cp.y))
+            hline.stroke()
+        }
+
+        if let r = rectGlobal() {
+            let s = toWin(NSPoint(x: r.minX, y: r.minY))
+            let rect = NSRect(x: s.x, y: s.y, width: r.width, height: r.height)
+            NSColor.white.withAlphaComponent(0.15).setFill()
+            rect.fill()
+            NSColor.white.setStroke()
+            let path = NSBezierPath(rect: rect)
+            path.lineWidth = 1.5
+            path.stroke()
+
+            // 已选区：四角绘制调整手柄
+            if st.selected {
+                for cp in corners(r) {
+                    let wp = toWin(cp)
+                    let h = NSRect(x: wp.x - 4, y: wp.y - 4, width: 8, height: 8)
+                    NSColor.systemBlue.setFill()
+                    NSBezierPath(rect: h).fill()
+                    NSColor.white.setStroke()
+                    let hs = NSBezierPath(rect: h); hs.lineWidth = 1; hs.stroke()
+                }
+            }
+
+            let w = Int(r.width.rounded()), h = Int(r.height.rounded())
+            if st.mode != .idle, let b = st.b {
+                // 拖拽中：光标旁显示选区尺寸 + 当前坐标
+                let sc = globalToScreenCapture(b)
+                drawLabel("\(w) × \(h)   x: \(Int(sc.x.rounded()))  y: \(Int(sc.y.rounded()))",
+                          near: toWin(b))
+            } else if st.selected {
+                // 选区确定：尺寸与调整提示贴在选框上沿中部（常显）
+                drawLabel("\(w) × \(h) · 拖角调整 · 内部移动 · 双击或确定确认",
+                          near: NSPoint(x: rect.midX, y: rect.maxY))
+            }
+        }
+
+        // 空闲时光标旁始终显示当前全局坐标（与最终输出一致）
+        if st.mode == .idle, let hover = hoverPoint {
+            let sc = globalToScreenCapture(hover)
+            drawLabel("x: \(Int(sc.x.rounded()))  y: \(Int(sc.y.rounded()))", near: toWin(hover))
+        }
+    }
+
+    // 深色圆角背景 + 等宽白字标签，自动避开屏幕边缘
+    func drawLabel(_ text: String, near p: NSPoint) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white
+        ]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let padX: CGFloat = 8, padY: CGFloat = 4
+        let labelW = textSize.width + padX * 2
+        let labelH = textSize.height + padY * 2
+        var lx = p.x + 14
+        var ly = p.y + 14
+        if lx + labelW > bounds.width - 4 { lx = p.x - 14 - labelW }
+        if ly + labelH > bounds.height - 4 { ly = p.y - 14 - labelH }
+        lx = max(lx, 4); ly = max(ly, 4)
+        let bg = NSRect(x: lx, y: ly, width: labelW, height: labelH)
+        NSColor.black.withAlphaComponent(0.78).setFill()
+        NSBezierPath(roundedRect: bg, xRadius: 5, yRadius: 5).fill()
+        (text as NSString).draw(at: NSPoint(x: lx + padX, y: ly + padY), withAttributes: attrs)
+    }
+
+    // 屏幕中心的操作提示：深色圆角背景 + 白色大字
+    func drawCenterHint(_ text: String) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 20, weight: .medium),
+            .foregroundColor: NSColor.white
+        ]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let padX: CGFloat = 20, padY: CGFloat = 12
+        let labelW = textSize.width + padX * 2
+        let labelH = textSize.height + padY * 2
+        let bg = NSRect(x: (bounds.width - labelW) / 2, y: (bounds.height - labelH) / 2,
+                        width: labelW, height: labelH)
+        NSColor.black.withAlphaComponent(0.72).setFill()
+        NSBezierPath(roundedRect: bg, xRadius: 10, yRadius: 10).fill()
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        let outline = NSBezierPath(roundedRect: bg, xRadius: 10, yRadius: 10)
+        outline.lineWidth = 1
+        outline.stroke()
+        (text as NSString).draw(at: NSPoint(x: bg.minX + padX, y: bg.minY + padY), withAttributes: attrs)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = tracking { removeTrackingArea(ta) }
+        // 必须含 .mouseEnteredAndExited，否则 mouseExited 不触发（鼠标离屏后边框不淡）
+        tracking = NSTrackingArea(rect: bounds,
+                                  options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(tracking!)
+    }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+    // 角点调整光标：AppKit 无公开对角 resize 光标，用 SF Symbol 对角箭头构造
+    // ↗↙ 用于左下(0)/右上(2)角，↖↘ 用于右下(1)/左上(3)角
+    static let diagNESW: NSCursor = makeDiagCursor("arrow.up.right.and.arrow.down.left")
+    static let diagNWSE: NSCursor = makeDiagCursor("arrow.up.left.and.arrow.down.right")
+    static func makeDiagCursor(_ sym: String) -> NSCursor {
+        if let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .black)) {
+            return NSCursor(image: img, hotSpot: NSPoint(x: img.size.width / 2, y: img.size.height / 2))
+        }
+        return .crosshair
+    }
+    // 根据命中位置返回光标：角点对角箭头、选区内部 openHand（拖动时 closedHand）
+    func cursorFor(_ p: NSPoint) -> NSCursor {
+        if st.selected, let r = rectGlobal() {
+            if let hit = corners(r).firstIndex(where: { hypot($0.x - p.x, $0.y - p.y) <= handleHit }) {
+                return (hit == 0 || hit == 2) ? RegionView.diagNESW : RegionView.diagNWSE
+            }
+            if NSPointInRect(p, r) { return NSCursor.openHand }
+        }
+        return NSCursor.crosshair
+    }
+    override func mouseEntered(with event: NSEvent) {
+        hoverPoint = toGlobal(event)
+        updateButtons()
+        needsDisplay = true
+    }
+    override func mouseMoved(with event: NSEvent) {
+        let p = toGlobal(event)
+        hoverPoint = p
+        if st.mode == .idle { cursorFor(p).set(); updateButtons() }
+        needsDisplay = true
+    }
+    override func mouseExited(with event: NSEvent) {
+        hoverPoint = nil
+        updateButtons()
+        needsDisplay = true
+    }
+
+    // 状态变化后刷新所有显示器视图：选区为全局坐标，任屏操作都要让各屏同步
+    // 重绘（清除其它屏幕中心提示、显示跨屏选框/按钮）
+    func refreshAll() {
+        for w in NSApp.windows {
+            if let v = w.contentView as? RegionView {
+                v.updateButtons()
+                v.needsDisplay = true
+            }
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeKey()
-        startPoint = toGlobal(event)
-        currentPoint = startPoint
-        needsDisplay = true
+        let p = toGlobal(event)
+        if st.selected, let r = rectGlobal() {
+            // 双击选区内部：直接确认
+            if event.clickCount == 2 && NSPointInRect(p, r) { confirm(); return }
+            // 角点命中 → 调整大小；内部命中 → 移动；外部 → 重新框选
+            if let hit = corners(r).firstIndex(where: { hypot($0.x - p.x, $0.y - p.y) <= handleHit }) {
+                st.mode = .resizing
+                st.resizeCorner = hit
+                st.fixedPoint = corners(r)[(hit + 2) % 4]  // 固定对角点
+            } else if NSPointInRect(p, r) {
+                st.mode = .moving
+                st.dragAnchor = p
+                st.moveA0 = st.a!; st.moveB0 = st.b!
+            } else {
+                st.mode = .creating
+                st.selected = false
+                st.a = p; st.b = p
+            }
+        } else {
+            st.mode = .creating
+            st.selected = false
+            st.a = p; st.b = p
+        }
+        refreshAll()
     }
     override func mouseDragged(with event: NSEvent) {
-        currentPoint = toGlobal(event)
-        needsDisplay = true
+        let p = toGlobal(event)
+        switch st.mode {
+        case .creating:
+            st.b = p
+        case .moving:
+            let d = NSPoint(x: p.x - st.dragAnchor.x, y: p.y - st.dragAnchor.y)
+            st.a = NSPoint(x: st.moveA0.x + d.x, y: st.moveA0.y + d.y)
+            st.b = NSPoint(x: st.moveB0.x + d.x, y: st.moveB0.y + d.y)
+            NSCursor.closedHand.set()
+        case .resizing:
+            // 固定对角点，移动被拖角点（固定点按下时已记录，拖过对侧也不会翻转）
+            st.a = st.fixedPoint; st.b = p
+            // 按起始角点锁定对角调整光标（拖拽中鼠标可能离开角点命中范围）
+            let c = st.resizeCorner
+            ((c == 0 || c == 2) ? RegionView.diagNESW : RegionView.diagNWSE).set()
+        case .idle:
+            break
+        }
+        refreshAll()
     }
     override func mouseUp(with event: NSEvent) {
-        currentPoint = toGlobal(event)
-        if let start = startPoint, let current = currentPoint {
-            let w = abs(current.x - start.x), h = abs(current.y - start.y)
-            if w > 5 && h > 5 { onSelect?(start, current) }
+        if st.mode == .creating {
+            if let r = rectGlobal(), r.width > 5 && r.height > 5 {
+                st.selected = true   // 松开后进入可调整状态，等待按钮/回车确认
+            } else {
+                st.a = nil; st.b = nil
+            }
         }
+        st.mode = .idle
+        refreshAll()
+    }
+
+    func confirm() {
+        guard st.selected, let a = st.a, let b = st.b else { return }
+        st.onSelect?(a, b)
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { exit(0) } // Esc 取消
+        if event.keyCode == 53 { exit(0) }            // Esc 取消
+        if event.keyCode == 36 { confirm() }          // 回车确认
     }
 }
 
 let app = NSApplication.shared
+// swift -e 启动的进程默认不是前台 GUI App，不激活则收不到键盘事件（Esc 无效）
+app.setActivationPolicy(.accessory)
+app.activate(ignoringOtherApps: true)
 let screens = NSScreen.screens
 guard !screens.isEmpty else { exit(1) }
 
 // 每个显示器创建独立遮罩窗口：单个跨多屏的 NSWindow 在副屏区域无法接收
 // 鼠标事件（事件路由只落在窗口所属屏幕），逐屏建窗保证所有显示器均可框选。
-var windows: [NSWindow] = []
+// 所有视图共享一个 SelectionState（选区为全局坐标，任屏操作各屏同步）。
+let st = SelectionState()
+st.onSelect = { start, current in
+    let sc1 = globalToScreenCapture(start)
+    let sc2 = globalToScreenCapture(current)
+    let x = Int(min(sc1.x, sc2.x).rounded())
+    let y = Int(min(sc1.y, sc2.y).rounded())
+    let w = Int(abs(sc1.x - sc2.x).rounded())
+    let h = Int(abs(sc1.y - sc2.y).rounded())
+    print("\(x),\(y),\(w),\(h)")
+    exit(0)
+}
+var windows: [KeyWindow] = []
 for screen in screens {
-    let win = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    let win = KeyWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
     win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 1)
     win.backgroundColor = NSColor.clear
     win.ignoresMouseEvents = false
     win.isOpaque = false
-    let view = RegionView(frame: NSRect(origin: .zero, size: screen.frame.size))
+    let view = RegionView(frame: NSRect(origin: .zero, size: screen.frame.size), st: st)
     win.contentView = view
-    view.onSelect = { start, current in
-        let sc1 = view.toScreenCapture(start)
-        let sc2 = view.toScreenCapture(current)
-        let x = Int(min(sc1.x, sc2.x).rounded())
-        let y = Int(min(sc1.y, sc2.y).rounded())
-        let w = Int(abs(sc1.x - sc2.x).rounded())
-        let h = Int(abs(sc1.y - sc2.y).rounded())
-        print("\(x),\(y),\(w),\(h)")
-        exit(0)
-    }
+    win.makeFirstResponder(view)
     win.makeKeyAndOrderFront(nil)
     windows.append(win)
 }
 app.run()
 "#;
+    // 注入中心提示语（转义反斜杠与引号，防止破坏 Swift 字符串）
+    let hint_esc = hint.replace('\\', "\\\\").replace('"', "\\\"");
+    let swift_code = swift_code.replace("__HINT__", &hint_esc);
 
     let output = Command::new("swift")
-        .args(["-e", swift_code])
+        .args(["-e", &swift_code])
         .output()
         .map_err(|e| format!("swift(select_region) 执行失败：{e}"))?;
 
@@ -344,6 +773,10 @@ app.run()
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        // Esc 取消：Swift 端 exit(0) 且无坐标输出
+        return Err("已取消区域选择".to_string());
+    }
     let parts: Vec<&str> = trimmed.split(',').collect();
     if parts.len() != 4 {
         return Err(format!("区域选择输出格式错误：{trimmed}"));
@@ -356,7 +789,7 @@ app.run()
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn select_region() -> Result<Region, String> {
+pub fn select_region(_hint: &str) -> Result<Region, String> {
     Err("区域选择仅支持 macOS".to_string())
 }
 

@@ -21,6 +21,8 @@ leptess = "0.14"
 image = "0.25"
 ocrs = "0.9"
 rten = "0.13"
+zstd = "0.13"
+rqrr = { version = "0.7", features = ["img"] }
 
 # rten（ocrs 的 ONNX 推理引擎）在 debug 模式下极慢（单次识别可达分钟级），
 # 对依赖开启优化，主包保持 opt-level=0 便于调试。

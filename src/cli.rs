@@ -32,6 +32,7 @@ use crate::utils::{
     gzip_compress, md5_of_bytes, sanitize_filename, set_log_level, type_command, type_text,
     zip_directory, LogLevel,
 };
+use crate::web::{self, run_web, WebArgs, RECEIVER_HTML};
 use crate::{error, warn};
 
 #[derive(Parser, Debug)]
@@ -124,6 +125,30 @@ struct Args {
     /// 反向传输时分片显示每行字符数（默认 50）。
     #[arg(long, value_parser = non_neg_int, default_value_t = 50)]
     pull_line_width: u64,
+
+    /// 网页接收端模式：向 VDI 浏览器 receiver.html 传输文件（本地文件路径）。
+    #[arg(long)]
+    web: Option<PathBuf>,
+
+    /// 网页模式每片原始字节数（默认 4096，支持 k/m 后缀）。
+    #[arg(long, value_parser = parse_size, default_value_t = web::DEFAULT_WEB_CHUNK)]
+    web_chunk: usize,
+
+    /// 网页模式单片最大重试次数（默认 10）。
+    #[arg(long, value_parser = non_neg_int, default_value_t = 10)]
+    web_max_retry: u64,
+
+    /// 网页模式交互式框选二维码反馈区域。
+    #[arg(long)]
+    web_region: bool,
+
+    /// 网页模式用可打印字符 `{`/`}` 做帧定界（替代 Ctrl+B/C，防 VDI 劫持）。
+    #[arg(long)]
+    web_printable_frame: bool,
+
+    /// 部署网页接收端：将内嵌 receiver.html 写到本地文件（默认 ./receiver.html）。
+    #[arg(long, num_args = 0..=1, default_missing_value = "receiver.html")]
+    deploy_receiver: Option<PathBuf>,
 }
 
 /// 分片模式产物。
@@ -191,6 +216,10 @@ pub fn main() {
 
     let result = if args.deploy_script {
         run_deploy(&args, &stop)
+    } else if let Some(out) = &args.deploy_receiver {
+        deploy_receiver_html(out)
+    } else if let Some(f) = &args.web {
+        run_web_mode(f, &args, &stop)
     } else if let Some(remote) = &args.pull {
         run_pull_mode(remote, &args, &stop)
     } else {
@@ -238,6 +267,50 @@ fn run_pull_mode(remote_path: &str, args: &Args, stop: &Arc<AtomicBool>) -> Resu
         type_command(cmd, interval, &mut |ch| backend.send_char(ch), stop);
     })?;
     std::mem::forget(backend); // 跳过 enigo Drop（其 Drop 中 thread::sleep 会累积阻塞）
+    Ok(())
+}
+
+/// 部署网页接收端：将内嵌 receiver.html 写到本地文件（一次性，送入 VDI 后浏览器打开）。
+fn deploy_receiver_html(out: &Path) -> Result<(), String> {
+    std::fs::write(out, RECEIVER_HTML).map_err(|e| format!("写入 {} 失败：{e}", out.display()))?;
+    println!("网页接收端已写入：{}", out.display());
+    println!("将该文件送入 VDI 并用 Chrome/Edge 打开，点击「选择保存目录」授权即可。");
+    Ok(())
+}
+
+/// 网页接收端模式动作：本机 → VDI 浏览器。
+fn run_web_mode(file: &Path, args: &Args, stop: &Arc<AtomicBool>) -> Result<(), String> {
+    if !file.is_file() {
+        return Err(format!(
+            "文件不存在：{}（--web 模式需指定单个文件）",
+            file.display()
+        ));
+    }
+
+    let mut web_args = WebArgs {
+        file: file.to_path_buf(),
+        chunk_bytes: args.web_chunk,
+        interval: args.interval,
+        dry_run: args.dry_run,
+        select_region: args.web_region,
+        region: None,
+        printable_frame: args.web_printable_frame,
+        max_retry: args.web_max_retry as usize,
+    };
+
+    if args.dry_run {
+        return run_web(&mut web_args, stop, None);
+    }
+
+    // 倒计时留给用户点击 VDI 浏览器窗口
+    // count_down(args.delay, stop);
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let mut backend = prepare_input(stop)?;
+    run_web(&mut web_args, stop, Some(&mut backend))?;
+    std::mem::forget(backend); // 跳过 enigo Drop（同 pull 模式）
     Ok(())
 }
 
@@ -1005,6 +1078,12 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            web: None,
+            web_chunk: web::DEFAULT_WEB_CHUNK,
+            web_max_retry: 10,
+            web_region: false,
+            web_printable_frame: false,
+            deploy_receiver: None,
             verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
@@ -1034,6 +1113,12 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            web: None,
+            web_chunk: web::DEFAULT_WEB_CHUNK,
+            web_max_retry: 10,
+            web_region: false,
+            web_printable_frame: false,
+            deploy_receiver: None,
             verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
@@ -1063,6 +1148,12 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            web: None,
+            web_chunk: web::DEFAULT_WEB_CHUNK,
+            web_max_retry: 10,
+            web_region: false,
+            web_printable_frame: false,
+            deploy_receiver: None,
             verbose: false,
         };
         let cmd = auto_invoke_command(&args, "uid.b32", "md5", None);
@@ -1164,6 +1255,12 @@ mod tests {
             pull_region: false,
             pull_char_space: true,
             pull_line_width: 50,
+            web: None,
+            web_chunk: web::DEFAULT_WEB_CHUNK,
+            web_max_retry: 10,
+            web_region: false,
+            web_printable_frame: false,
+            deploy_receiver: None,
             verbose: false,
         };
         // 单次模式：不传 part_md5s
