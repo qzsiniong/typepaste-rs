@@ -280,6 +280,7 @@ class RegionView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeKey()
         startPoint = toGlobal(event)
         currentPoint = startPoint
         needsDisplay = true
@@ -303,27 +304,31 @@ class RegionView: NSView {
 let app = NSApplication.shared
 let screens = NSScreen.screens
 guard !screens.isEmpty else { exit(1) }
-// 覆盖所有显示器的并集矩形
-var union = NSRect.zero
-for s in screens { union = union.union(s.frame) }
-let win = NSWindow(contentRect: union, styleMask: [.borderless], backing: .buffered, defer: false)
-win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 1)
-win.backgroundColor = NSColor.clear
-win.ignoresMouseEvents = false
-win.isOpaque = false
-let view = RegionView(frame: union)
-win.contentView = view
-view.onSelect = { start, current in
-    let sc1 = view.toScreenCapture(start)
-    let sc2 = view.toScreenCapture(current)
-    let x = Int(min(sc1.x, sc2.x).rounded())
-    let y = Int(min(sc1.y, sc2.y).rounded())
-    let w = Int(abs(sc1.x - sc2.x).rounded())
-    let h = Int(abs(sc1.y - sc2.y).rounded())
-    print("\(x),\(y),\(w),\(h)")
-    exit(0)
+
+// 每个显示器创建独立遮罩窗口：单个跨多屏的 NSWindow 在副屏区域无法接收
+// 鼠标事件（事件路由只落在窗口所属屏幕），逐屏建窗保证所有显示器均可框选。
+var windows: [NSWindow] = []
+for screen in screens {
+    let win = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 1)
+    win.backgroundColor = NSColor.clear
+    win.ignoresMouseEvents = false
+    win.isOpaque = false
+    let view = RegionView(frame: NSRect(origin: .zero, size: screen.frame.size))
+    win.contentView = view
+    view.onSelect = { start, current in
+        let sc1 = view.toScreenCapture(start)
+        let sc2 = view.toScreenCapture(current)
+        let x = Int(min(sc1.x, sc2.x).rounded())
+        let y = Int(min(sc1.y, sc2.y).rounded())
+        let w = Int(abs(sc1.x - sc2.x).rounded())
+        let h = Int(abs(sc1.y - sc2.y).rounded())
+        print("\(x),\(y),\(w),\(h)")
+        exit(0)
+    }
+    win.makeKeyAndOrderFront(nil)
+    windows.append(win)
 }
-win.makeKeyAndOrderFront(nil)
 app.run()
 "#;
 
