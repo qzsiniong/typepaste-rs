@@ -811,4 +811,400 @@ mod tests {
         // 非法 hex
         assert!(parse_bitmask("zz").is_empty());
     }
+
+    // ===== 分片边界与数量 =====
+
+    #[test]
+    fn empty_file_single_frame() {
+        // 空文件：0 字节 → 至少 1 片
+        let p = tmp_file("tp_web_empty.bin", b"");
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.raw_size, 0);
+        assert_eq!(prep.frames.len(), 1);
+        // 往返验证
+        let fields: Vec<&str> = prep.frames[0].body.split('|').collect();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(fields[5])
+            .unwrap();
+        let raw = if prep.zflag == 1 {
+            zstd::stream::decode_all(payload.as_slice()).unwrap()
+        } else {
+            payload
+        };
+        assert_eq!(raw, b"");
+        assert_eq!(prep.file_md5, md5_of_bytes(b""));
+    }
+
+    #[test]
+    fn exact_chunk_boundary_one_frame() {
+        // 文件大小恰好 == chunk_bytes → 1 片
+        let data = vec![0xABu8; 4096];
+        let p = tmp_file("tp_web_exact.bin", &data);
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.frames.len(), 1, "恰好等于 chunk 大小应为 1 片");
+    }
+
+    #[test]
+    fn one_byte_over_boundary_two_frames() {
+        // 文件大小 = chunk_bytes + 1 → 2 片（用高熵数据避免压缩后变 1 片）
+        let mut data = vec![0u8; 4097];
+        let mut s: u32 = 0xABCDEF01;
+        for b in &mut data {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *b = s as u8;
+        }
+        let p = tmp_file("tp_web_over.bin", &data);
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.frames.len(), 2);
+        // 验证末片 payload 小于 chunk_bytes（压缩后可能不同，但原始切片末尾为 1 字节）
+        // 收集原始切片大小（解压后验证）
+        let mut concatenated = Vec::new();
+        for f in &prep.frames {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(fields[5])
+                .unwrap();
+            concatenated.extend_from_slice(&payload);
+        }
+        let raw = if prep.zflag == 1 {
+            zstd::stream::decode_all(concatenated.as_slice()).unwrap()
+        } else {
+            concatenated
+        };
+        assert_eq!(raw.len(), 4097);
+        assert_eq!(raw, data);
+    }
+
+    #[test]
+    fn many_chunks_consistent_total() {
+        // 多片：所有帧的 total 字段一致，seq 连续（高熵数据确保压缩后仍多片）
+        let mut data = Vec::with_capacity(10240);
+        let mut s: u32 = 0x42424242;
+        for _ in 0..10240 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            data.push(s as u8);
+        }
+        let p = tmp_file("tp_web_multi.bin", &data);
+        let prep = prepare(&p, 1024).unwrap();
+        assert!(prep.frames.len() >= 10);
+        let total = prep.frames.len();
+        for (seq, f) in prep.frames.iter().enumerate() {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            assert_eq!(fields[0], seq.to_string(), "seq 应连续");
+            assert_eq!(fields[1], total.to_string(), "total 应一致");
+        }
+    }
+
+    #[test]
+    fn chunk_bytes_one_extreme() {
+        // chunk_bytes=1 极端情况（小文件避免海量片）
+        let data = b"abc";
+        let p = tmp_file("tp_web_chunk1.bin", data);
+        let prep = prepare(&p, 1).unwrap();
+        // 压缩后字节数 ≠ 原始 3，但 div_ceil 保证至少 1
+        let total = prep.frames.len();
+        // 往返验证
+        let mut concatenated = Vec::new();
+        for f in &prep.frames {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(fields[5])
+                .unwrap();
+            concatenated.extend_from_slice(&payload);
+        }
+        let raw = if prep.zflag == 1 {
+            zstd::stream::decode_all(concatenated.as_slice()).unwrap()
+        } else {
+            concatenated
+        };
+        assert_eq!(raw, data);
+        assert!(total >= 3 || prep.zflag == 1, "未压缩时至少 3 片");
+    }
+
+    // ===== 文件名处理 =====
+
+    #[test]
+    fn filename_with_chinese() {
+        let data = b"test";
+        let p = tmp_file("tp_web_中文文件.txt", data);
+        let prep = prepare(&p, 4096).unwrap();
+        let fields: Vec<&str> = prep.frames[0].body.split('|').collect();
+        assert_eq!(fields.len(), 7, "seq=0 应携带文件名");
+        let name = base64::engine::general_purpose::STANDARD
+            .decode(fields[6])
+            .unwrap();
+        assert_eq!(String::from_utf8(name).unwrap(), "tp_web_中文文件.txt");
+    }
+
+    #[test]
+    fn filename_no_extension() {
+        let data = b"test";
+        let p = tmp_file("tp_web_noext", data);
+        let prep = prepare(&p, 4096).unwrap();
+        let fields: Vec<&str> = prep.frames[0].body.split('|').collect();
+        let name = base64::engine::general_purpose::STANDARD
+            .decode(fields[6])
+            .unwrap();
+        assert_eq!(String::from_utf8(name).unwrap(), "tp_web_noext");
+    }
+
+    #[test]
+    fn filename_only_on_seq0() {
+        // 多片场景下仅 seq=0 携带文件名（高熵数据确保多片）
+        let mut data = Vec::with_capacity(5000);
+        let mut s: u32 = 0x77777777;
+        for _ in 0..5000 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            data.push(s as u8);
+        }
+        let p = tmp_file("tp_web_name_check.bin", &data);
+        let prep = prepare(&p, 1024).unwrap();
+        assert!(prep.frames.len() > 1);
+        for (seq, f) in prep.frames.iter().enumerate() {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            if seq == 0 {
+                assert_eq!(fields.len(), 7);
+            } else {
+                assert_eq!(fields.len(), 6, "seq>0 不应携带文件名");
+            }
+        }
+    }
+
+    // ===== 压缩策略 =====
+
+    #[test]
+    fn high_entropy_skips_compression() {
+        // 不可压缩数据 → zflag=0
+        let mut data = Vec::with_capacity(8192);
+        let mut s: u32 = 0xDEADBEEF;
+        for _ in 0..8192 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            data.push(s as u8);
+        }
+        let p = tmp_file("tp_web_entropy.bin", &data);
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.zflag, 0, "高熵数据不应压缩");
+    }
+
+    #[test]
+    fn low_entropy_uses_compression() {
+        // 全零数据 → 压缩率极高 → zflag=1
+        let data = vec![0u8; 8192];
+        let p = tmp_file("tp_web_zeros.bin", &data);
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.zflag, 1, "全零数据应启用压缩");
+    }
+
+    // ===== md5 校验 =====
+
+    #[test]
+    fn every_chunk_md5_correct() {
+        // 每片 md5 字段 == payload(base64解码后) 的 md5
+        let data = vec![0x55u8; 6000];
+        let p = tmp_file("tp_web_md5.bin", &data);
+        let prep = prepare(&p, 1024).unwrap();
+        for (seq, f) in prep.frames.iter().enumerate() {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(fields[5])
+                .unwrap();
+            assert_eq!(md5_of_bytes(&payload), fields[4], "片 {seq} md5 不匹配");
+        }
+    }
+
+    #[test]
+    fn file_md5_matches_raw() {
+        // Prepared.file_md5 == 原始文件 md5（非压缩后）
+        let data = b"hello typepaste world";
+        let p = tmp_file("tp_web_fmd5.bin", data);
+        let prep = prepare(&p, 4096).unwrap();
+        assert_eq!(prep.file_md5, md5_of_bytes(data));
+    }
+
+    // ===== 往返重组 =====
+
+    #[test]
+    fn roundtrip_exact_boundary() {
+        // 压缩后恰好为 chunk_bytes 倍数的往返
+        let data = b"A".repeat(4096);
+        let p = tmp_file("tp_web_rt_exact.bin", &data);
+        let prep = prepare(&p, 4096).unwrap();
+        let mut concatenated = Vec::new();
+        for f in &prep.frames {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(fields[5])
+                .unwrap();
+            concatenated.extend_from_slice(&payload);
+        }
+        let raw = if prep.zflag == 1 {
+            zstd::stream::decode_all(concatenated.as_slice()).unwrap()
+        } else {
+            concatenated
+        };
+        assert_eq!(raw, data);
+    }
+
+    #[test]
+    fn roundtrip_binary_multiple_chunks() {
+        // 二进制数据多片往返（高熵数据确保压缩后仍多片）
+        let mut data = Vec::with_capacity(7000);
+        let mut s: u32 = 0xCAFEBABE;
+        for _ in 0..7000 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            data.push(s as u8);
+        }
+        let p = tmp_file("tp_web_rt_bin.bin", &data);
+        let prep = prepare(&p, 1024).unwrap();
+        assert!(prep.frames.len() > 1);
+        let mut concatenated = Vec::new();
+        for f in &prep.frames {
+            let fields: Vec<&str> = f.body.split('|').collect();
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(fields[5])
+                .unwrap();
+            concatenated.extend_from_slice(&payload);
+        }
+        let raw = if prep.zflag == 1 {
+            zstd::stream::decode_all(concatenated.as_slice()).unwrap()
+        } else {
+            concatenated
+        };
+        assert_eq!(raw, data);
+    }
+
+    // ===== PROBE 帧体 =====
+
+    #[test]
+    fn probe_body_empty_file() {
+        let p = tmp_file("tp_web_probe_empty.bin", b"");
+        let prep = prepare(&p, 4096).unwrap();
+        let body = build_probe_body(&prep);
+        let fields: Vec<&str> = body.split('|').collect();
+        assert_eq!(fields[0], "-1");
+        assert_eq!(fields[1], "1", "空文件仍 1 片");
+        assert_eq!(fields[2], "0");
+        assert_eq!(fields[3], prep.zflag.to_string());
+        assert_eq!(fields[4], prep.name_b64);
+        assert_eq!(fields[5], prep.file_md5);
+    }
+
+    #[test]
+    fn probe_body_multi_chunk() {
+        let data = vec![0u8; 10000];
+        let p = tmp_file("tp_web_probe_multi.bin", &data);
+        let prep = prepare(&p, 1024).unwrap();
+        let body = build_probe_body(&prep);
+        let fields: Vec<&str> = body.split('|').collect();
+        assert_eq!(fields[0], "-1");
+        assert_eq!(fields[1], prep.frames.len().to_string());
+        assert_eq!(fields[2], "10000");
+        assert_eq!(fields[3], prep.zflag.to_string());
+        assert_eq!(fields[4], prep.name_b64);
+        assert_eq!(fields[5], prep.file_md5);
+    }
+
+    // ===== 位图解析 =====
+
+    #[test]
+    fn bitmask_all_bits_set() {
+        // 0xFF = bits 0-7 all set
+        let present = parse_bitmask("ff");
+        for i in 0..8 {
+            assert!(present.contains(&i), "bit {i} 应存在");
+        }
+        assert!(!present.contains(&8));
+    }
+
+    #[test]
+    fn bitmask_byte_boundary() {
+        // 0x0001 = bit 8 set（第二字节最低位）
+        let present = parse_bitmask("0001");
+        assert!(!present.contains(&7));
+        assert!(present.contains(&8));
+        assert!(!present.contains(&9));
+    }
+
+    #[test]
+    fn bitmask_large_multi_byte() {
+        // 0xFF FF = bits 0-15 all set
+        let present = parse_bitmask("ffff");
+        assert_eq!(present.len(), 16);
+        for i in 0..16 {
+            assert!(present.contains(&i));
+        }
+    }
+
+    #[test]
+    fn bitmask_uppercase_hex() {
+        // 大写 hex 应与 小写 等价
+        let lower = parse_bitmask("0a");
+        let upper = parse_bitmask("0A");
+        assert_eq!(lower, upper);
+        assert!(lower.contains(&1) && lower.contains(&3));
+    }
+
+    #[test]
+    fn bitmask_single_bit_per_byte() {
+        // 0x0101 = bits 0 和 8
+        let present = parse_bitmask("0101");
+        assert!(present.contains(&0));
+        assert!(present.contains(&8));
+        assert_eq!(present.len(), 2);
+    }
+
+    #[test]
+    fn bitmask_odd_length_hex() {
+        // 奇数长度 hex：hex::decode 会失败 → 返回空集
+        let present = parse_bitmask("0a0");
+        assert!(present.is_empty(), "奇数长度 hex 应返回空集");
+    }
+
+    // ===== dry-run =====
+
+    #[test]
+    fn dry_run_completes_without_error() {
+        let data = b"dry run test data";
+        let p = tmp_file("tp_web_dryrun.bin", data);
+        let args = WebArgs {
+            file: p,
+            chunk_bytes: 4096,
+            interval: 5,
+            dry_run: true,
+            select_region: false,
+            region: None,
+            printable_frame: false,
+            max_retry: 5,
+        };
+        // dry_run_web 应返回 Ok，不依赖 backend
+        assert!(dry_run_web(&args).is_ok());
+    }
+
+    #[test]
+    fn dry_run_printable_frame_flag() {
+        let data = b"printable";
+        let p = tmp_file("tp_web_dryrun_pf.bin", data);
+        let args = WebArgs {
+            file: p,
+            chunk_bytes: 4096,
+            interval: 5,
+            dry_run: true,
+            select_region: false,
+            region: None,
+            printable_frame: true,
+            max_retry: 5,
+        };
+        // 可打印帧标记不影响 dry-run 成功
+        assert!(dry_run_web(&args).is_ok());
+    }
 }
