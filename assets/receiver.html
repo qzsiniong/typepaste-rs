@@ -193,13 +193,14 @@ function bytesToB64(bytes) {
 var $status = document.getElementById('status');
 var $sub = document.getElementById('sub');
 var dirHandle = null;
-var writer = null;
-var fileName = null;
-var expectedSeq = 0;
-var total = 0;
+var fileName = null;     // 目标文件名（最终落盘名）
+var total = 0;           // 分片总数
+var rawSize = 0;         // 原始文件字节数
+var zflag = 0;           // 压缩标志
+var received = new Set();// 已成功落盘的 seq 集合
 var frameBuf = '';
 var inFrame = false;
-var fullMd5 = new Md5();
+var transferStart = 0;   // 首片落盘时间戳（ms）
 
 function setStatus(text, cls) {
   $status.textContent = text;
@@ -365,23 +366,178 @@ function feedback(status, seq, md5, err) {
 }
 
 /* ===== 文件写入 ===== */
+
+// 读取文件句柄的全部字节
+async function readHandleBytes(fh) {
+  var file = await fh.getFile();
+  var buf = await file.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// 把字节写入 {fileName}.p{seq+1}，回读校验 md5 通过才算成功。
+async function writePartFile(seq, payload) {
+  if (!dirHandle) throw new Error('未授权保存目录');
+  var partName = fileName + '.p' + (seq + 1);
+  var fh = await dirHandle.getFileHandle(partName, { create: true });
+  var w = await fh.createWritable();
+  await w.write(payload);
+  await w.close();
+  // 回读校验：确保落盘内容与内存一致（防止写入中断产生脏文件）
+  var back = await readHandleBytes(fh);
+  if (md5Hex(back) !== md5Hex(payload)) {
+    await dirHandle.removeEntry(partName);
+    throw new Error('分片落盘后回读校验失败');
+  }
+}
+
+// 扫描目录中已存在的 {fileName}.p{N}，返回已存在的 seq 集合（0-based）。
+async function scanExistingParts() {
+  var set = new Set();
+  if (!dirHandle) return set;
+  var prefix = fileName + '.p';
+  for await (var entry of dirHandle.values()) {
+    if (entry.kind !== 'file') continue;
+    if (!entry.name.startsWith(prefix)) continue;
+    var nStr = entry.name.slice(prefix.length);
+    if (!/^\d+$/.test(nStr)) continue;
+    var n = parseInt(nStr, 10);
+    if (n >= 1 && n <= total) set.add(n - 1);
+  }
+  return set;
+}
+
+// 把已存在 seq 集合转为位图 hex 字符串。
+function bitmaskHex(set) {
+  var byteLen = Math.ceil(total / 8);
+  var bytes = new Uint8Array(byteLen);
+  set.forEach(function (seq) {
+    var bi = Math.floor(seq / 8);
+    var bit = seq % 8;
+    bytes[bi] |= (1 << bit);
+  });
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+  return hex;
+}
+
+// 拼接所有分片 → 解压（若 zflag）→ 写最终文件 → 返回整文件 md5。
+async function assemble() {
+  var bytes = new Uint8Array(receivedBytes);
+  var off = 0;
+  for (var seq = 0; seq < total; seq++) {
+    var partName = fileName + '.p' + (seq + 1);
+    var fh = await dirHandle.getFileHandle(partName, { create: false });
+    var part = await readHandleBytes(fh);
+    bytes.set(part, off);
+    off += part.length;
+  }
+  var final = zflag ? fzstd.decompress(bytes) : bytes;
+  var full = md5Hex(final);
+  // 写入最终文件
+  var fh = await dirHandle.getFileHandle(fileName, { create: true });
+  var w = await fh.createWritable();
+  await w.write(final);
+  await w.close();
+  return { md5: full, size: final.length };
+}
+
+// 重置传输状态（新文件 / PROBE 重置）
+function resetTransfer() {
+  received = new Set();
+  receivedBytes = 0;
+  transferStart = 0;
+  $dataView.textContent = '';
+  lastLogStatus = '';
+}
+
 async function handleFrame(body) {
   var parts = body.split('|');
   if (parts.length < 6) {
-    feedback('ERROR', expectedSeq, '', '帧字段不足: ' + parts.length);
+    feedback('ERROR', 0, '', '帧字段不足: ' + parts.length);
     return;
   }
   var seq = parseInt(parts[0], 10);
-  total = parseInt(parts[1], 10);
-  var zstdFlag = parseInt(parts[3], 10);
-  var md5chunk = parts[4];
-  var b64 = parts[5];
-  var nameB64 = parts[6];
-
-  if (!Number.isInteger(seq) || !Number.isInteger(total)) {
-    feedback('ERROR', expectedSeq, '', '帧头解析失败');
+  if (!Number.isInteger(seq)) {
+    feedback('ERROR', 0, '', '帧头解析失败');
     return;
   }
+
+  // ===== PROBE 帧（seq = -1）：协商断点续传 =====
+  if (seq === -1) {
+    if (!dirHandle) { feedback('UNAUTH', 0, '', '未授权保存目录，请先点击「选择保存目录」'); return; }
+    if (parts.length < 6) { feedback('ERROR', -1, '', 'PROBE 字段不足'); return; }
+    total = parseInt(parts[1], 10);
+    rawSize = parseInt(parts[2], 10);
+    zflag = parseInt(parts[3], 10);
+    var nameB64 = parts[4];
+    var fileMd5 = parts[5];
+    if (nameB64) {
+      var nm = new TextDecoder().decode(b64ToBytes(nameB64));
+      fileName = nm.split(/[\\/]/).pop() || 'received.bin';
+    } else {
+      fileName = 'received.bin';
+    }
+    resetTransfer();
+
+    // 1) 完整文件已存在且 md5 匹配 → 直接完成
+    try {
+      var fullFh = await dirHandle.getFileHandle(fileName, { create: false });
+      var fullBytes = await readHandleBytes(fullFh);
+      if (md5Hex(fullBytes) === fileMd5) {
+        setStatus('✅ 文件已存在且校验通过: ' + fileName, 'ok');
+        dataLine('ok', '═══ 文件已存在，MD5 校验通过，跳过传输 ═══');
+        feedback('FINISH', total - 1, fileMd5, '');
+        return;
+      }
+    } catch (e) { /* 文件不存在，继续扫描分片 */ }
+
+    // 2) 扫描已存在的 .pN 分片
+    received = await scanExistingParts();
+    receivedBytes = 0;
+    // 统计已存在分片的字节数（用于进度显示）
+    for (var s of received) {
+      try {
+        var pFh = await dirHandle.getFileHandle(fileName + '.p' + (s + 1), { create: false });
+        receivedBytes += (await readHandleBytes(pFh)).length;
+      } catch (e) {}
+    }
+
+    dataLine('evt', '═══ 续传探测：' + fileName + ' · 共 ' + total + ' 片 · 已存在 ' +
+      received.size + ' 片' + (zflag ? ' · zstd' : '') + ' ═══');
+
+    if (received.size === total) {
+      // 所有分片已存在 → 直接拼接解压
+      var r = await assemble();
+      var elapsed = transferStart ? ((Date.now() - transferStart) / 1000) : 0;
+      setStatus('✅ 传输完成: ' + fileName + '（' + total + ' 片）', 'ok');
+      dataLine('ok', '═══ 传输完成 · ' + fmtBytes(r.size) + ' · MD5 ' + r.md5 +
+        (elapsed ? ' · 耗时 ' + elapsed.toFixed(1) + 's' : '') + ' ═══');
+      feedback('FINISH', total - 1, r.md5, '');
+      fileName = null;
+      return;
+    }
+
+    // 3) 返回位图给发送端
+    var mask = bitmaskHex(received);
+    updateRecvProg(received.size);
+    setStatus('🔍 续传：已存在 ' + received.size + '/' + total + ' 片，等待传输剩余分片…', '');
+    feedback('PROBE', -1, mask, '');
+    return;
+  }
+
+  // ===== 数据帧 =====
+  total = parseInt(parts[1], 10);
+  rawSize = parseInt(parts[2], 10);
+  var zstdFlag = parseInt(parts[3], 10);
+  zflag = zstdFlag;
+  var md5chunk = parts[4];
+  var b64 = parts[5];
+  var nameB64Data = parts[6];
+  if (nameB64Data && !fileName) {
+    var nm2 = new TextDecoder().decode(b64ToBytes(nameB64Data));
+    fileName = nm2.split(/[\\/]/).pop() || 'received.bin';
+  }
+  if (!dirHandle) { feedback('UNAUTH', 0, '', '未授权保存目录，请先点击「选择保存目录」'); return; }
 
   var payload;
   try { payload = b64ToBytes(b64); }
@@ -391,60 +547,30 @@ async function handleFrame(body) {
     feedback('RETRY', seq, md5chunk, '分片md5不匹配');
     return;
   }
-  if (seq !== expectedSeq) {
-    feedback('RETRY', seq, md5chunk, '序号不符，期望 ' + expectedSeq);
-    return;
-  }
-
-  var raw;
-  try { raw = zstdFlag ? fzstd.decompress(payload) : payload; }
-  catch (e) { feedback('RETRY', seq, md5chunk, 'zstd解压失败: ' + e.message); return; }
 
   try {
-    if (seq === 0) {
-      if (!dirHandle) { feedback('UNAUTH', 0, '', '未授权保存目录，请先点击「选择保存目录」'); return; }
-      // seq 0 语义为新文件：复位传输状态与数据面板（兼容中断后重新开始）
-      expectedSeq = 0;
-      fullMd5 = new Md5();
-      receivedBytes = 0;
-      $dataView.textContent = '';
-      lastLogStatus = '';
-      if (nameB64) {
-        var name = new TextDecoder().decode(b64ToBytes(nameB64));
-        fileName = name.split(/[\\/]/).pop() || 'received.bin';
-      } else {
-        fileName = 'received.bin';
-      }
-      var fh = await dirHandle.getFileHandle(fileName, { create: true });
-      writer = await fh.createWritable();
-      setStatus('开始接收: ' + fileName, '');
-      dataLine('evt', '═══ 开始接收 ' + fileName + ' · 共 ' + total + ' 片 · ' +
-        (zstdFlag ? 'zstd 压缩' : '未压缩') + ' ═══');
-    }
-    await writer.write(raw);
-    fullMd5.update(raw);
-    expectedSeq++;
-    receivedBytes += raw.length;
+    if (transferStart === 0) transferStart = Date.now();
+    await writePartFile(seq, payload);
+    received.add(seq);
+    receivedBytes += payload.length;
 
-    // 实时面板：片事件 + hex/ASCII 转储 + 进度条
-    dataLine('evt', '── 片 ' + (seq + 1) + '/' + total + ' · ' + fmtBytes(raw.length) +
+    dataLine('evt', '── 片 ' + (seq + 1) + '/' + total + ' · ' + fmtBytes(payload.length) +
       ' · md5 ' + md5chunk.slice(0, 12) + (zstdFlag ? ' · zstd' : '') + ' ──');
-    hexDump(raw);
-    updateRecvProg(expectedSeq);
+    updateRecvProg(received.size);
 
-    if (expectedSeq === total) {
-      await writer.close();
-      writer = null;
-      var full = fullMd5.hex();
-      setStatus('✅ 传输完成: ' + fileName + '（' + total + ' 片，' + fmtBytes(receivedBytes) + '）', 'ok');
-      dataLine('ok', '═══ 传输完成 · 共 ' + fmtBytes(receivedBytes) + ' · MD5 ' + full + ' ═══');
-      feedback('FINISH', seq, full, '');
-      // 复位，准备下一个文件
-      expectedSeq = 0;
-      fullMd5 = new Md5();
+    if (received.size === total) {
+      var res = await assemble();
+      var elapsed = ((Date.now() - transferStart) / 1000);
+      setStatus('✅ 传输完成: ' + fileName + '（' + total + ' 片，' +
+        fmtBytes(res.size) + '，耗时 ' + elapsed.toFixed(1) + 's）', 'ok');
+      dataLine('ok', '═══ 传输完成 · ' + fmtBytes(res.size) + ' · MD5 ' + res.md5 +
+        ' · 耗时 ' + elapsed.toFixed(1) + 's ═══');
+      feedback('FINISH', seq, res.md5, '');
       fileName = null;
     } else {
-      setStatus('✅ 已接收 ' + (seq + 1) + ' / ' + total + ' 片（' + fmtBytes(receivedBytes) + '）', 'ok');
+      var elapsed2 = ((Date.now() - transferStart) / 1000);
+      setStatus('✅ 已接收 ' + received.size + ' / ' + total + ' 片（' +
+        fmtBytes(receivedBytes) + '，已用 ' + elapsed2.toFixed(1) + 's）', 'ok');
       feedback('OK', seq, md5chunk, '');
     }
   } catch (e) {
@@ -519,14 +645,14 @@ window.addEventListener('keydown', function (e) {
 window.addEventListener('blur', function () {
   if (!dirHandle) return;
   setStatus('⏸ 窗口失焦，已暂停（切回页面自动恢复）', 'warn');
-  feedback('PAUSE', Math.max(0, expectedSeq - 1), '', '');
+  feedback('PAUSE', received.size, '', '');
 });
 window.addEventListener('focus', function () {
   if (inFrame) liveFrameReset(); // 失焦期间可能残留半个帧，丢弃并记录
   inFrame = false; frameBuf = '';
   if (dirHandle) {
     setStatus('▶ 页面聚焦，等待传输…', '');
-    feedback('READY', expectedSeq, '', '');
+    feedback('READY', received.size, '', '');
   } else {
     feedback('UNAUTH', 0, '', '未授权保存目录');
   }

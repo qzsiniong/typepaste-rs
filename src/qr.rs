@@ -26,6 +26,8 @@ pub enum Status {
     Error,
     /// 尚未授权保存目录（发送端应继续等待，不传输、不报致命错误）。
     Unauth,
+    /// 断点续传探测结果：md5 字段承载已存在分片的位图 hex。
+    Probe,
 }
 
 impl Status {
@@ -38,6 +40,7 @@ impl Status {
             "FINISH" => Some(Status::Finish),
             "ERROR" => Some(Status::Error),
             "UNAUTH" => Some(Status::Unauth),
+            "PROBE" => Some(Status::Probe),
             _ => None,
         }
     }
@@ -144,6 +147,7 @@ mod tests {
             ("FINISH", Status::Finish),
             ("ERROR", Status::Error),
             ("UNAUTH", Status::Unauth),
+            ("PROBE", Status::Probe),
         ] {
             let json = format!(r#"{{"seq":0,"status":"{s}","md5":"","err":""}}"#);
             let fb = parse_feedback(&json).unwrap();

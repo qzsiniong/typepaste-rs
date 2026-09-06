@@ -81,9 +81,13 @@ struct Prepared {
     raw_size: usize,
     /// 原始文件 md5（FINISH 时整体校验）。
     file_md5: String,
+    /// 文件名（base64，用于 PROBE 帧）。
+    name_b64: String,
+    /// 压缩标志（1=整体 zstd，0=未压缩）。
+    zflag: u8,
 }
 
-/// 读取文件 → 分片 → 每片独立 zstd 压缩（或跳过）→ 组装协议帧。
+/// 读取文件 → 整体 zstd 压缩（无收益则用原始字节）→ 按 chunk_bytes 分片 → 组装协议帧。
 fn prepare(file: &Path, chunk_bytes: usize) -> Result<Prepared, String> {
     let raw = fs::read(file).map_err(|e| format!("读取文件失败：{e}"))?;
     let raw_size = raw.len();
@@ -94,39 +98,29 @@ fn prepare(file: &Path, chunk_bytes: usize) -> Result<Prepared, String> {
         .unwrap_or_else(|| "received.bin".to_string());
     let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
 
-    let total = raw_size.div_ceil(chunk_bytes).max(1);
-
-    // 先按每片独立压缩试算，整体无收益则全部走原始字节。
-    let mut compressed_chunks: Vec<Vec<u8>> = Vec::with_capacity(total);
-    let mut compressed_total = 0usize;
-    for seq in 0..total {
-        let start = seq * chunk_bytes;
-        let end = (start + chunk_bytes).min(raw_size);
-        let c = zstd::stream::encode_all(&raw[start..end], ZSTD_LEVEL)
-            .map_err(|e| format!("zstd 压缩失败：{e}"))?;
-        compressed_total += c.len();
-        compressed_chunks.push(c);
-    }
-    let use_compress = (compressed_total as f64) < (raw_size as f64) * COMPRESS_USE_RATIO;
+    // 整体压缩：比逐片压缩率更高，接收端只需一次解压。
+    let compressed = zstd::stream::encode_all(&raw[..], ZSTD_LEVEL)
+        .map_err(|e| format!("zstd 压缩失败：{e}"))?;
+    let use_compress = (compressed.len() as f64) < (raw_size as f64) * COMPRESS_USE_RATIO;
     let zflag = if use_compress { 1u8 } else { 0u8 };
+    let payload_bytes: &[u8] = if use_compress { &compressed } else { &raw };
     debug!(
-        "压缩策略：{}（压缩后 {compressed_total}B / 原始 {raw_size}B）",
+        "压缩策略：{}（压缩后 {}B / 原始 {raw_size}B）",
         if use_compress {
             "zstd 启用"
         } else {
             "高熵跳过压缩"
-        }
+        },
+        payload_bytes.len()
     );
 
+    let total = payload_bytes.len().div_ceil(chunk_bytes).max(1);
+
     let mut frames = Vec::with_capacity(total);
-    for (seq, compressed) in compressed_chunks.iter().enumerate() {
+    for seq in 0..total {
         let start = seq * chunk_bytes;
-        let end = (start + chunk_bytes).min(raw_size);
-        let payload: &[u8] = if use_compress {
-            compressed
-        } else {
-            &raw[start..end]
-        };
+        let end = (start + chunk_bytes).min(payload_bytes.len());
+        let payload = &payload_bytes[start..end];
         let md5 = md5_of_bytes(payload);
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
         let mut body = format!("{seq}|{total}|{raw_size}|{zflag}|{md5}|{b64}");
@@ -141,7 +135,78 @@ fn prepare(file: &Path, chunk_bytes: usize) -> Result<Prepared, String> {
         frames,
         raw_size,
         file_md5,
+        name_b64,
+        zflag,
     })
+}
+
+/// 构建 PROBE 帧体：`-1|total|raw_size|zflag|name_b64|file_md5`。
+fn build_probe_body(prep: &Prepared) -> String {
+    let total = prep.frames.len();
+    format!(
+        "-1|{}|{}|{}|{}|{}",
+        total, prep.raw_size, prep.zflag, prep.name_b64, prep.file_md5
+    )
+}
+
+/// 解析接收端 PROBE 反馈的位图 hex 字符串为已存在分片序号集合。
+/// bit i 对应 seq i；byte0 = bits 0-7，低位在前。
+fn parse_bitmask(hex: &str) -> std::collections::HashSet<usize> {
+    let mut present = std::collections::HashSet::new();
+    let bytes = match hex::decode(hex) {
+        Ok(b) => b,
+        Err(_) => return present,
+    };
+    for (byte_idx, &b) in bytes.iter().enumerate() {
+        for bit in 0..8u8 {
+            if b & (1 << bit) != 0 {
+                present.insert(byte_idx * 8 + bit as usize);
+            }
+        }
+    }
+    present
+}
+
+/// PROBE 轮询结果。
+enum ProbeAck {
+    /// 整文件已在远端且 md5 匹配（直接结束）。
+    Complete,
+    /// 断点续传：返回已存在分片集合。
+    Resume(std::collections::HashSet<usize>),
+}
+
+/// 发送 PROBE 后等待接收端反馈（FINISH=完整文件已存在 / PROBE=位图）。
+fn await_probe(region: Option<Region>, stop: &Arc<AtomicBool>) -> Result<ProbeAck, String> {
+    let start = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("已停止".to_string());
+        }
+        match qr::read_feedback(region) {
+            Ok(Some(fb)) => match fb.status {
+                Status::Finish => return Ok(ProbeAck::Complete),
+                Status::Probe => {
+                    let present = parse_bitmask(&fb.md5);
+                    return Ok(ProbeAck::Resume(present));
+                }
+                Status::Error => {
+                    return Err(format!("接收端错误：{}", fb.err));
+                }
+                Status::Unauth => {
+                    return Err(
+                        "接收端未授权保存目录（页面可能已刷新），请重新授权后开始传输".to_string(),
+                    );
+                }
+                _ => {} // READY/OK/PAUSE/RETRY：继续等 PROBE/FINISH
+            },
+            Ok(None) => {}
+            Err(e) => debug!("二维码读取异常：{e}"),
+        }
+        if start.elapsed() >= ACK_TIMEOUT {
+            return Err("等待 PROBE 反馈超时".to_string());
+        }
+        std::thread::sleep(QR_POLL_INTERVAL);
+    }
 }
 
 /// 网页传输主入口。`backend` 为 None 时为 dry-run。
@@ -174,6 +239,7 @@ pub fn run_web(
     // 等待接收端就绪
     info!("等待接收端就绪（请在 VDI 打开 receiver.html、授权目录并点击浏览器窗口）...");
     wait_ready(args.region, stop)?;
+    let t0 = Instant::now();
 
     // 启动本机前台 App 焦点监视器：READY 时前台即 VDI 窗口，以此为基线；
     // 帧发送过程中用户切走窗口可在 1 个字符内停止输入，避免脏数据
@@ -185,10 +251,47 @@ pub fn run_web(
         }
     };
 
+    // 发送 PROBE 帧，协商断点续传（哪些分片已在远端落盘）。
+    let probe_body = build_probe_body(&prep);
+    info!("发送 PROBE 协商断点续传...");
+    let completed = send_frame(
+        backend,
+        &probe_body,
+        args,
+        stop,
+        args.region,
+        monitor.as_ref(),
+        &make_web_progress(0),
+    )?;
+    if !completed {
+        wait_while_paused(args.region, stop, monitor.as_ref())?;
+    }
+    let present = match await_probe(args.region, stop)? {
+        ProbeAck::Complete => {
+            let elapsed = t0.elapsed();
+            info!(
+                "远端已存在完整文件且 MD5 校验通过 ✓（耗时 {:.2}s）",
+                elapsed.as_secs_f64()
+            );
+            return Ok(());
+        }
+        ProbeAck::Resume(p) => p,
+    };
+    let present_count = present.len();
+    if present_count > 0 {
+        info!("断点续传：跳过已存在的 {present_count}/{total} 片");
+    }
+
     let pb = make_web_progress(total as u64);
+    if present_count > 0 {
+        pb.set_position(present_count as u64);
+    }
     set_global_pb(Some(pb.clone()));
 
     for seq in 0..total {
+        if present.contains(&seq) {
+            continue;
+        }
         if stop.load(Ordering::Relaxed) {
             set_global_pb(None);
             pb.finish_and_clear();
@@ -231,8 +334,17 @@ pub fn run_web(
                     pb.inc(1);
                     set_global_pb(None);
                     pb.finish();
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        prep.raw_size as f64 / 1024.0 / elapsed
+                    } else {
+                        0.0
+                    };
                     if fb.md5 == prep.file_md5 {
-                        info!("传输完成，整文件 MD5 校验通过 ✓");
+                        info!(
+                            "传输完成，整文件 MD5 校验通过 ✓（耗时 {:.2}s，{} 片，{} 字节，{:.1} KB/s）",
+                            elapsed, total, prep.raw_size, rate
+                        );
                     } else {
                         error!("整文件 MD5 不一致：本地 {}，远端 {}", prep.file_md5, fb.md5);
                         return Err("整文件 MD5 校验失败".to_string());
@@ -268,7 +380,26 @@ pub fn run_web(
 
     set_global_pb(None);
     pb.finish();
-    // 末片未收到 FINISH（理论上 await_ack 会先返回 Finished）
+    // 若所有分片已存在（present_count == total），接收端应在 PROBE 阶段直接 FINISH；
+    // 此处兜底等待 FINISH 确认。
+    if present_count == total {
+        match await_ack(args.region, total - 1, stop) {
+            Ok(Ack::Finished(fb)) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                if fb.md5 == prep.file_md5 {
+                    info!(
+                        "传输完成（全部分片已存在），MD5 校验通过 ✓（耗时 {:.2}s）",
+                        elapsed
+                    );
+                    return Ok(());
+                }
+                error!("整文件 MD5 不一致：本地 {}，远端 {}", prep.file_md5, fb.md5);
+                return Err("整文件 MD5 校验失败".to_string());
+            }
+            Ok(Ack::Acked) | Ok(Ack::Paused) | Ok(Ack::Resend) => {}
+            Err(e) => return Err(e),
+        }
+    }
     Err("传输结束但未收到接收端 FINISH 确认".to_string())
 }
 
@@ -486,7 +617,7 @@ fn wait_while_paused(
                         "接收端未授权保存目录（页面可能已刷新），请重新授权后开始传输".to_string(),
                     )
                 }
-                Status::Pause | Status::Retry => {} // 继续等聚焦
+                Status::Pause | Status::Retry | Status::Probe => {} // 继续等聚焦
             },
             Ok(None) => {}
             Err(e) => debug!("二维码读取异常：{e}"),
@@ -527,7 +658,19 @@ fn dry_run_web(args: &WebArgs) -> Result<(), String> {
             "Ctrl+B / Ctrl+C"
         }
     );
-    println!("  [流程] 等待二维码 READY → 逐片发送帧 → 二维码 OK/RETRY/PAUSE/FINISH");
+    println!(
+        "  压缩    ：{}（zflag={}）",
+        if prep.zflag == 1 {
+            "整体 zstd"
+        } else {
+            "未压缩"
+        },
+        prep.zflag
+    );
+    println!("  [流程] 等待 READY → PROBE 协商续传（位图）→ 逐片发送 → OK/RETRY/PAUSE/FINISH");
+    let probe = build_probe_body(&prep);
+    let probe_preview: String = probe.chars().take(120).collect();
+    println!("  PROBE 预览：{probe_preview}...");
     if let Some(first) = prep.frames.first() {
         let preview: String = first.body.chars().take(120).collect();
         println!("  帧 0 预览：{preview}...");
@@ -548,34 +691,36 @@ mod tests {
 
     #[test]
     fn frame_format_and_roundtrip() {
-        // 高熵随机数据 → 跳过压缩；验证帧结构与重组往返
-        let data: Vec<u8> = (0..9000u32)
-            .map(|i| i.wrapping_mul(2654435761) as u8)
-            .collect();
+        // 用不可压缩数据验证帧结构与重组往返（压缩与否均通过）
+        let mut data = Vec::with_capacity(9000);
+        let mut s: u32 = 0x12345678;
+        for _ in 0..9000 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            data.push(s as u8);
+        }
         let p = tmp_file("tp_web_test_high.bin", &data);
         let prep = prepare(&p, 4096).unwrap();
         assert_eq!(prep.raw_size, 9000);
-        assert_eq!(prep.frames.len(), 3);
+        let total = prep.frames.len();
+        assert!(total >= 1);
 
-        // 重组
-        let mut reassembled = Vec::new();
+        // 收集所有 payload（整体压缩时为单一 zstd 流的片段，需拼接后一次解压）
+        let mut zflag: u8 = 0;
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
         for (seq, f) in prep.frames.iter().enumerate() {
             let fields: Vec<&str> = f.body.split('|').collect();
             assert!(fields.len() >= 6, "片 {seq} 字段不足");
             assert_eq!(fields[0], seq.to_string());
-            assert_eq!(fields[1], "3");
+            assert_eq!(fields[1], total.to_string());
             assert_eq!(fields[2], "9000");
-            let zflag: u8 = fields[3].parse().unwrap();
+            zflag = fields[3].parse().unwrap();
             let payload = base64::engine::general_purpose::STANDARD
                 .decode(fields[5])
                 .unwrap();
             assert_eq!(md5_of_bytes(&payload), fields[4], "片 {seq} md5 不匹配");
-            let raw = if zflag == 1 {
-                zstd::stream::decode_all(payload.as_slice()).unwrap()
-            } else {
-                payload
-            };
-            reassembled.extend_from_slice(&raw);
+            payloads.push(payload);
             // 文件名字段仅 seq=0
             if seq == 0 {
                 assert_eq!(fields.len(), 7);
@@ -587,6 +732,12 @@ mod tests {
                 assert_eq!(fields.len(), 6);
             }
         }
+        let concatenated: Vec<u8> = payloads.into_iter().flatten().collect();
+        let reassembled = if zflag == 1 {
+            zstd::stream::decode_all(concatenated.as_slice()).unwrap()
+        } else {
+            concatenated
+        };
         assert_eq!(reassembled, data);
         assert_eq!(prep.file_md5, md5_of_bytes(&data));
     }
@@ -597,24 +748,18 @@ mod tests {
         let data = b"hello typepaste web transfer ".repeat(500);
         let p = tmp_file("tp_web_test_text.txt", &data);
         let prep = prepare(&p, 4096).unwrap();
-        let zflag: u8 = prep.frames[0]
-            .body
-            .split('|')
-            .nth(3)
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(zflag, 1, "高重复文本应启用 zstd");
+        assert_eq!(prep.zflag, 1, "高重复文本应启用 zstd");
 
-        // 重组验证
-        let mut out = Vec::new();
+        // 重组验证：拼接所有 payload 后一次解压
+        let mut concatenated = Vec::new();
         for f in &prep.frames {
             let fields: Vec<&str> = f.body.split('|').collect();
             let payload = base64::engine::general_purpose::STANDARD
                 .decode(fields[5])
                 .unwrap();
-            out.extend_from_slice(&zstd::stream::decode_all(payload.as_slice()).unwrap());
+            concatenated.extend_from_slice(&payload);
         }
+        let out = zstd::stream::decode_all(concatenated.as_slice()).unwrap();
         assert_eq!(out, data);
     }
 
@@ -627,16 +772,43 @@ mod tests {
         let fields: Vec<&str> = prep.frames[0].body.split('|').collect();
         assert_eq!(fields[0], "0");
         assert_eq!(fields[1], "1");
-        // 小文件压缩通常无收益 → zflag=0（即使压缩，重组测试已覆盖）
         let payload = base64::engine::general_purpose::STANDARD
             .decode(fields[5])
             .unwrap();
-        let zflag: u8 = fields[3].parse().unwrap();
-        let raw = if zflag == 1 {
+        let raw = if prep.zflag == 1 {
             zstd::stream::decode_all(payload.as_slice()).unwrap()
         } else {
             payload
         };
         assert_eq!(&raw, b"hi");
+    }
+
+    #[test]
+    fn probe_body_format() {
+        let data = b"hello world";
+        let p = tmp_file("tp_web_test_probe.bin", data);
+        let prep = prepare(&p, 4096).unwrap();
+        let body = build_probe_body(&prep);
+        let fields: Vec<&str> = body.split('|').collect();
+        assert_eq!(fields[0], "-1");
+        assert_eq!(fields[1], prep.frames.len().to_string());
+        assert_eq!(fields[2], prep.raw_size.to_string());
+        assert_eq!(fields[3], prep.zflag.to_string());
+        assert_eq!(fields[4], prep.name_b64);
+        assert_eq!(fields[5], prep.file_md5);
+    }
+
+    #[test]
+    fn bitmask_parsing() {
+        // 0x05 = bits 0,2 set → seqs 0,2 present
+        let present = parse_bitmask("05");
+        assert!(present.contains(&0));
+        assert!(!present.contains(&1));
+        assert!(present.contains(&2));
+        assert!(!present.contains(&3));
+        // 空位图
+        assert!(parse_bitmask("").is_empty());
+        // 非法 hex
+        assert!(parse_bitmask("zz").is_empty());
     }
 }

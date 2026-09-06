@@ -158,6 +158,60 @@ flowchart TD
     Restore --> Done([还原完成])
 ```
 
+**⑤ 网页传输（`--web`，本机 → VDI 浏览器 receiver.html）**
+
+```mermaid
+flowchart TD
+    Start([--web 文件]) --> Prep[prepare:<br/>整体 zstd 压缩 → 按 chunk 分片]
+    Prep --> Ready[wait_ready 等待 READY]
+    Ready --> ProbeSend["发送 PROBE 帧<br/>-1|total|raw_size|zflag|name_b64|file_md5"]
+    ProbeSend --> ProbeAck{await_probe}
+    ProbeAck -->|FINISH| FullMatch{fb.md5 == prep.file_md5?}
+    FullMatch -->|是| Done([完成 ✓])
+    FullMatch -->|否| Err1([整文件 md5 不一致])
+    ProbeAck -->|PROBE| ParseMask[解析位图 present 集合]
+    ParseMask --> Loop{遍历 seq 0..total-1}
+    Loop -->|seq in present| Skip[跳过该片]
+    Loop -->|seq missing| Send["发送数据帧<br/>seq|total|raw_size|zflag|md5Chunk|b64"]
+    Skip --> Loop
+    Send --> Ack{await_ack}
+    Ack -->|OK| Next[继续下一片]
+    Ack -->|RETRY| Retry[重传当前片]
+    Ack -->|PAUSE| Pause[等待聚焦]
+    Next --> Loop
+    Retry --> Send
+    Pause --> Send
+    Loop -->|全部处理完| FinishWait[等待 FINISH]
+    FinishWait --> Md5Check{fb.md5 == prep.file_md5?}
+    Md5Check -->|是| Done
+    Md5Check -->|否| Err2([整文件 md5 不一致])
+```
+
+**⑥ 网页接收端（receiver.html）处理流程**
+
+```mermaid
+flowchart TD
+    Recv([收到帧]) --> IsProbe{seq == -1?}
+    IsProbe -->|是| Probe[解析 total/raw_size/zflag/<br/>name/file_md5]
+    Probe --> HasFull{"完整文件 {name} 存在<br/>且 md5 匹配?"}
+    HasFull -->|是| FbFinish[反馈 FINISH]
+    HasFull -->|否| Scan["扫描 {name}.p* 文件"]
+    Scan --> Mask[构建位图 bitmask_hex]
+    Mask --> FbProbe[反馈 PROBE md5=bitmask_hex]
+    IsProbe -->|否| Data[校验 md5Chunk]
+    Data -->|失败| FbRetry[反馈 RETRY]
+    Data -->|成功| Write["写入 {name}.p{seq+1}<br/>received.add seq"]
+    Write --> HasAll{received.size == total?}
+    HasAll -->|否| FbOk[反馈 OK seq]
+    HasAll -->|是| Concat[拼接 p1..pN]
+    Concat --> Dec{zflag==1?}
+    Dec -->|是| Decompress[zstd 解压]
+    Dec -->|否| Raw[直接用]
+    Decompress --> WriteFinal["写入 {name} + 算 md5"]
+    Raw --> WriteFinal
+    WriteFinal --> FbFinish2[反馈 FINISH md5=fullMd5]
+```
+
 ### 典型流程
 
 **1. 首次使用：部署还原脚本到目标机**
@@ -256,6 +310,26 @@ flowchart TD
 - OCR 使用 **Tesseract**（leptess 绑定）：通过 `tessedit_char_whitelist` 强制只输出 `0-9a-f`，从根本上消除 `ó→6`、`O→0`、`l→1` 等字符混淆；图像预处理（灰度 + 缩放到合适宽度）由 `image` crate 完成。Tesseract LSTM 对图像尺寸敏感，重试时自动切换缩放宽度（700–1600px）以提高识别率。识别后仍保留 `hex_confusion` 纠正作为安全网。需先 `brew install tesseract leptonica pkg-config`。
 - `--pull` 与正向 `file` 互斥；与 `--deploy-script` 互斥。
 - Plan B（QR 码序列）预留，暂未实现。
+
+## 网页传输（本机 → VDI 浏览器）
+
+```bash
+# 部署 receiver.html 到本地，再送入 VDI 用 Chrome/Edge 打开
+typepaste-rs --deploy-receiver /tmp/receiver.html
+
+# 传输文件到 VDI 浏览器（receiver.html 需已打开并授权保存目录）
+typepaste-rs --web ./file.bin --web-region
+```
+
+通过 `--web` 把本机文件传到 VDI 浏览器中的 `receiver.html`。原理：本机模拟键盘把分片 base64 逐帧输入浏览器，`receiver.html` 校验每片 md5 后落盘为 `{name}.p1`/`.p2`…，全部到齐后拼接、zstd 解压、写最终文件，并通过二维码反馈状态（本机截屏解码驱动 ARQ）。
+
+**要点**
+
+- **整体 zstd 压缩**：`prepare()` 先对整个文件 zstd 压缩（无收益则用原始字节），再按 `--web-chunk` 分片，接收端全部到齐后一次解压。
+- **断点续传**：发送前先发 `PROBE` 帧，`receiver.html` 扫描目录中已存在的 `.pN` 分片，用位图反馈已存在哪些片，发送端跳过已存在分片。完整文件已存在且 md5 匹配时直接完成。
+- **每片独立落盘**：`{name}.p{seq+1}`，落盘前校验 md5、落盘后回读校验，确保存在即正确。
+- **反馈通道**：二维码（`READY`/`OK`/`RETRY`/`PAUSE`/`FINISH`/`ERROR`/`UNAUTH`/`PROBE`），本机 rqrr 截屏解码。
+- **焦点保护**：本机前台 App 焦点监视器 + 二维码 PAUSE 双重检测，失焦 1 字符内停止输入。
 
 ## 还原脚本
 
