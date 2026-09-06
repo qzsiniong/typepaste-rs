@@ -314,7 +314,13 @@ pub fn type_text<F: FnMut(char)>(
         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_char(ch))) {
             pb.abandon();
             set_global_pb(None);
-            error!("\n输入失败（第 {}/{} 字符 '{}'）：{:?}", i + 1, total, ch, e);
+            error!(
+                "\n输入失败（第 {}/{} 字符 '{}'）：{:?}",
+                i + 1,
+                total,
+                ch,
+                e
+            );
             error!("   可能原因：辅助功能权限被撤销、目标窗口失焦、后端异常");
             std::process::exit(1);
         }
@@ -359,7 +365,13 @@ pub fn type_text_abortable<F: FnMut(char)>(
         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_char(ch))) {
             pb.abandon();
             set_global_pb(None);
-            error!("\n输入失败（第 {}/{} 字符 '{}'）：{:?}", i + 1, total, ch, e);
+            error!(
+                "\n输入失败（第 {}/{} 字符 '{}'）：{:?}",
+                i + 1,
+                total,
+                ch,
+                e
+            );
             error!("   可能原因：辅助功能权限被撤销、目标窗口失焦、后端异常");
             std::process::exit(1);
         }
